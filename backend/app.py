@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text  # IMPORTANT: Add this import
 from datetime import datetime
 import os
 import json
@@ -9,6 +10,7 @@ import string
 from dotenv import load_dotenv
 import psycopg2
 from sqlalchemy.exc import SQLAlchemyError
+import urllib.parse
 
 # Load environment variables
 load_dotenv()
@@ -20,8 +22,29 @@ app = Flask(__name__)
 # DATABASE CONFIGURATION - POSTGRESQL
 # ============================================
 
-# Get database URL from environment variable or use default
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:your_password@localhost:5432/haji_younas_db')
+# Get database URL from environment variable
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/haji_younas_db')
+
+# If password contains special characters, URL encode it
+# The .env should already have URL encoded password, but just in case
+try:
+    # Parse the URL to check if password needs encoding
+    from urllib.parse import urlparse, quote, unquote
+    
+    parsed = urlparse(DATABASE_URL)
+    if parsed.password:
+        # Check if password is already encoded
+        decoded_password = unquote(parsed.password)
+        if decoded_password != parsed.password:
+            # Password is encoded, keep as is
+            pass
+        elif any(c in parsed.password for c in '!@#$%^&*()'):
+            # Password has special chars, encode it
+            encoded_password = quote(parsed.password, safe='')
+            DATABASE_URL = f"{parsed.scheme}://{parsed.username}:{encoded_password}@{parsed.hostname}:{parsed.port}{parsed.path}"
+            print("✅ Password encoded for database connection")
+except Exception as e:
+    print(f"⚠️ Could not parse DATABASE_URL: {e}")
 
 # Configure PostgreSQL
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
@@ -33,12 +56,23 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 }
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
 
-# Configure CORS properly
+# Configure CORS properly - Allow all for development
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+        "origins": [
+            "http://localhost:3000", 
+            "http://127.0.0.1:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+            "http://localhost:3002",
+            "http://127.0.0.1:3002",
+            "*"  # Allow all for development
+        ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization", "Accept"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": True,
+        "max_age": 3600
     }
 })
 
@@ -194,31 +228,48 @@ def generate_id():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
 
 # ============================================
-# API ROUTES
+# FIXED HEALTH CHECK - Using text()
 # ============================================
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health_check():
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'OK'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        return response
+    
     try:
-        # Test database connection
-        db.session.execute('SELECT 1')
+        # FIXED: Use text() for raw SQL
+        db.session.execute(text('SELECT 1'))
         db_status = 'connected'
+        db_details = 'PostgreSQL connection successful'
     except Exception as e:
-        db_status = f'disconnected: {str(e)}'
+        db_status = 'disconnected'
+        db_details = str(e)
     
     return jsonify({
         'status': 'OK',
         'timestamp': datetime.utcnow().isoformat(),
         'database': db_status,
-        'database_type': 'PostgreSQL'
+        'database_details': db_details,
+        'database_type': 'PostgreSQL',
+        'server': 'Flask',
+        'port': 5000,
+        'cors_enabled': True
     })
 
 # ============================================
 # SITES ROUTES
 # ============================================
 
-@app.route('/api/sites', methods=['GET'])
+@app.route('/api/sites', methods=['GET', 'OPTIONS'])
 def get_sites():
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'OK'})
+        return response
+    
     try:
         sites = Site.query.order_by(Site.created_at.desc()).all()
         return jsonify([s.to_dict() for s in sites])
@@ -601,6 +652,21 @@ def chat():
         return jsonify({'error': str(e)}), 500
 
 # ============================================
+# ADD CORS HEADERS MANUALLY (Fallback)
+# ============================================
+
+@app.after_request
+def after_request(response):
+    """Add CORS headers to every response"""
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers.add('Access-Control-Allow-Origin', origin)
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
+
+# ============================================
 # ERROR HANDLERS
 # ============================================
 
@@ -714,7 +780,10 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"❌ Database error: {e}")
             print("📁 Please check your PostgreSQL connection settings.")
+            print(f"📁 DATABASE_URL: {DATABASE_URL}")
     
-    print(f"🚀 Starting Flask server on http://127.0.0.1:5000")
+    print("🚀 Starting Flask server...")
+    print(f"📡 Server: http://127.0.0.1:5000")
+    print(f"🔗 API Base: http://127.0.0.1:5000/api")
     print(f"📁 Database: PostgreSQL")
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)
