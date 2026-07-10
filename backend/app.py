@@ -15,39 +15,25 @@ load_dotenv()
 app = Flask(__name__)
 
 # ============================================
-# DATABASE CONFIGURATION - UPDATED FOR RAILWAY
+# DATABASE CONFIGURATION
 # ============================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTANCE_PATH = os.path.join(BASE_DIR, 'instance')
 
-# Use PostgreSQL if DATABASE_URL is provided (Railway), otherwise use SQLite
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
+# Create instance folder if it doesn't exist
+if not os.path.exists(INSTANCE_PATH):
+    os.makedirs(INSTANCE_PATH)
 
-if DATABASE_URL:
-    # Convert postgres:// to postgresql:// for SQLAlchemy
-    if DATABASE_URL.startswith('postgres://'):
-        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
-    print("✅ Using PostgreSQL database")
-else:
-    # Fallback to SQLite for local development
-    INSTANCE_PATH = os.path.join(BASE_DIR, 'instance')
-    if not os.path.exists(INSTANCE_PATH):
-        os.makedirs(INSTANCE_PATH)
-    DB_PATH = os.path.join(INSTANCE_PATH, 'haji_younas.db')
-    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
-    print("✅ Using SQLite database")
-
+# Use absolute path for database
+DB_PATH = os.path.join(INSTANCE_PATH, 'haji_younas.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
 
-# Configure CORS for production
+# Configure CORS properly
 CORS(app, resources={
     r"/api/*": {
-        "origins": [
-            "https://younas-frontend.vercel.app",  # Your Vercel frontend URL
-            "http://localhost:3000",
-            "*"  # Allow all for testing
-        ],
+        "origins": ["http://localhost:3000", "http://127.0.0.1:3000", "*"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -65,8 +51,7 @@ def index():
         'message': 'Haji Younas Contracting API',
         'status': 'running',
         'version': '1.0.0',
-        'environment': os.environ.get('FLASK_ENV', 'development'),
-        'database': 'PostgreSQL' if DATABASE_URL else 'SQLite',
+        'database': DB_PATH,
         'endpoints': {
             'health': '/api/health',
             'sites': '/api/sites',
@@ -155,8 +140,8 @@ class Attendance(db.Model):
     id = db.Column(db.String(20), primary_key=True)
     worker_id = db.Column(db.String(20), db.ForeignKey('workers.id'), nullable=False)
     date = db.Column(db.String(10), nullable=False)
-    checked_in = db.Column(db.String(50))
-    checked_out = db.Column(db.String(50))
+    checked_in = db.Column(db.String(50))  # ISO datetime string
+    checked_out = db.Column(db.String(50))  # ISO datetime string
     present = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -197,7 +182,7 @@ def health_check():
         'status': 'OK',
         'timestamp': datetime.utcnow().isoformat(),
         'database': 'connected' if db.engine else 'disconnected',
-        'environment': os.environ.get('FLASK_ENV', 'development')
+        'db_path': DB_PATH
     })
 
 # Sites Routes
@@ -325,7 +310,9 @@ def delete_entry(entry_id):
     db.session.commit()
     return jsonify({'message': 'Entry deleted successfully'})
 
-# Attendance Routes
+# ============================================
+# ATTENDANCE ROUTES - WITH CHECKED_IN/OUT
+# ============================================
 @app.route('/api/attendance', methods=['GET'])
 def get_attendance():
     worker_id = request.args.get('workerId')
@@ -349,9 +336,11 @@ def create_or_update_attendance():
     checked_out = data.get('checkedOut')
     present = data.get('present', False)
     
+    # Find existing record
     record = Attendance.query.filter_by(worker_id=worker_id, date=date).first()
     
     if record:
+        # Update existing record
         if checked_in is not None:
             record.checked_in = checked_in
         if checked_out is not None:
@@ -360,6 +349,7 @@ def create_or_update_attendance():
             record.present = present
         record.updated_at = datetime.utcnow()
     else:
+        # Create new record
         record = Attendance(
             id=generate_id(),
             worker_id=worker_id,
@@ -403,9 +393,11 @@ def update_settings():
 # AI Chat endpoint
 @app.route('/api/chat', methods=['POST'])
 def chat():
+    """Simple rule-based AI assistant"""
     data = request.json
     message = data.get('message', '').lower()
     
+    # Calculate summary
     entries = Entry.query.all()
     total_kamai = sum(e.kamai for e in entries)
     total_labour = sum(e.labour for e in entries)
@@ -438,6 +430,7 @@ def chat():
         for worker in workers:
             attendance = Attendance.query.filter_by(worker_id=worker.id).all()
             days_present = sum(1 for a in attendance if a.present)
+            # Calculate total hours
             total_hours = 0
             for a in attendance:
                 if a.checked_in and a.checked_out:
@@ -464,23 +457,31 @@ def chat():
 
 @app.cli.command('init-db')
 def init_db_command():
+    """Initialize the database"""
     with app.app_context():
         db.create_all()
+        
+        # Create default settings
         if not Setting.query.filter_by(key='monthly_overhead').first():
             setting = Setting(key='monthly_overhead', value=json.dumps(194.0))
             db.session.add(setting)
             db.session.commit()
+        
         print("✅ Database initialized successfully")
+        print(f"📁 Database location: {DB_PATH}")
 
 @app.cli.command('seed-test')
 def seed_test():
+    """Add test data"""
     from datetime import datetime, timedelta
     
     with app.app_context():
+        # Check if data exists
         if Site.query.first():
             print("⚠️ Data already exists. Skipping seed.")
             return
         
+        # Create sites
         sites = [
             Site(id='s1', name='Jasra Villa Al Hilal', location='Jasra', manager='Ahmed'),
             Site(id='s2', name='Seef Tower', location='Seef', manager='Khalid'),
@@ -488,6 +489,7 @@ def seed_test():
         for site in sites:
             db.session.add(site)
         
+        # Create workers
         workers = [
             Worker(id='w1', name='Ali', role='Mason', daily_rate=12.0),
             Worker(id='w2', name='Rahim', role='Helper', daily_rate=8.0),
@@ -496,6 +498,7 @@ def seed_test():
         for worker in workers:
             db.session.add(worker)
         
+        # Create entries
         today = datetime.now()
         for i in range(5):
             date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
@@ -520,19 +523,27 @@ def seed_test():
 # ============================================
 
 if __name__ == '__main__':
+    # Create tables if they don't exist
     with app.app_context():
         try:
             db.create_all()
             print("✅ Database tables created successfully")
             
+            # Create default settings if not exists
             if not Setting.query.filter_by(key='monthly_overhead').first():
                 setting = Setting(key='monthly_overhead', value=json.dumps(194.0))
                 db.session.add(setting)
                 db.session.commit()
                 print("✅ Default settings created")
+                
         except Exception as e:
             print(f"❌ Database error: {e}")
+            print("📁 Please make sure the 'instance' folder exists and is writable.")
     
-    port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port)
+    print(f"🚀 Starting Flask server on http://127.0.0.1:5000")
+    print(f"📁 Database: {DB_PATH}")
+    # For Vercel deployment
+    app = app  # Vercel looks for 'app' variable
+
+    if __name__ == '__main__':
+     app.run(debug=True, host='127.0.0.1', port=5000)
