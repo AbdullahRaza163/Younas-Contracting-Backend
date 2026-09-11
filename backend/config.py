@@ -45,8 +45,10 @@ class Config:
         "http://127.0.0.1:5173",
         "http://localhost:8080",
         "http://127.0.0.1:8080",
-         "http://192.168.100.79:3000",
-          "http://192.168.10.25:3000",
+        "http://192.168.100.79:3000",
+        "http://192.168.10.25:3000",
+        "https://younas-contracting-9pdp-git-main-razaabdullah.vercel.app",
+        "https://younas-contracting-9pdp-cyan.vercel.app"
 
     ]
     
