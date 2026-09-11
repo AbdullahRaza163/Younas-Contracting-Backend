@@ -46,6 +46,8 @@ class Config:
         "http://localhost:8080",
         "http://127.0.0.1:8080",
          "http://192.168.100.79:3000",
+          "http://192.168.10.25:3000",
+
     ]
     
     CORS_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
