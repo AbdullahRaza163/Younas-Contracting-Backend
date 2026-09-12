@@ -26,7 +26,8 @@ def _daily_overhead_for_site(entry_date, site_id, sites_count):
         from utils.helpers import calculate_daily_overhead
         month_key = entry_date.strftime('%Y-%m')
         return float(calculate_daily_overhead(month_key, site_id) or 0)
-    except Exception:
+    except Exception as e:
+        print(f"[auto_entry] overhead fallback triggered: {e}")
         from models import Setting
         row = Setting.query.filter_by(key='monthly_overhead').first()
         monthly = float(row.value) if row and row.value else 0.0
@@ -49,7 +50,7 @@ def compute_auto_entries(entry_date, site_id=None):
     if isinstance(entry_date, str):
         entry_date = datetime.strptime(entry_date, '%Y-%m-%d').date()
 
-    # Which sites to consider
+    # -------- Which sites to consider --------
     if site_id:
         sites = Site.query.filter_by(id=site_id).all()
     else:
@@ -61,9 +62,7 @@ def compute_auto_entries(entry_date, site_id=None):
     sites_count = len(sites)
     site_ids = [s.id for s in sites]
 
-    # ------------------------------------------------------------------
-    # 1. LABOUR — from attendance
-    # ------------------------------------------------------------------
+    # -------- 1. LABOUR — from attendance --------
     attendance_rows = Attendance.query.filter(
         Attendance.date == entry_date,
         Attendance.site_id.in_(site_ids),
@@ -85,16 +84,17 @@ def compute_auto_entries(entry_date, site_id=None):
         labour_by_site[a.site_id] = labour_by_site.get(a.site_id, 0) + wage
         has_activity_by_site[a.site_id] = True
 
-    # ------------------------------------------------------------------
-    # 2. ONE-TIME / MATERIAL / EQUIPMENT / TRANSPORT / OTHER — from expenses
-    # ------------------------------------------------------------------
-    expense_rows = Expense.query.filter(Expense.date == entry_date).all()
+    # -------- 2. ONE-TIME / MATERIAL / EQUIPMENT / TRANSPORT / OTHER --------
+    expense_rows = Expense.query.filter(
+        Expense.date == entry_date,
+        Expense.site_id.in_(site_ids),
+    ).all()
 
-    one_time_by_site = {sid: 0.0 for sid in site_ids}
-    material_by_site = {sid: 0.0 for sid in site_ids}
+    one_time_by_site  = {sid: 0.0 for sid in site_ids}
+    material_by_site  = {sid: 0.0 for sid in site_ids}
     equipment_by_site = {sid: 0.0 for sid in site_ids}
     transport_by_site = {sid: 0.0 for sid in site_ids}
-    other_by_site = {sid: 0.0 for sid in site_ids}
+    other_by_site     = {sid: 0.0 for sid in site_ids}
 
     for e in expense_rows:
         sid = e.site_id
@@ -115,45 +115,54 @@ def compute_auto_entries(entry_date, site_id=None):
             one_time_by_site[sid] += amount
         has_activity_by_site[sid] = True
 
-    # ------------------------------------------------------------------
-    # 3. KAMAI — from invoices
-    # ------------------------------------------------------------------
+    # -------- 3. KAMAI — from invoices --------
+    # ⚠️ CHECK: if your Invoice model uses `date` instead of `invoice_date`,
+    #           change the next line to: Invoice.date == entry_date
     try:
-        invoice_rows = Invoice.query.filter(Invoice.invoice_date == entry_date).all()
-    except Exception:
-        invoice_rows = []
+        invoice_rows = Invoice.query.filter(
+            Invoice.invoice_date == entry_date,
+            Invoice.site_id.in_(site_ids),
+        ).all()
+    except Exception as e:
+        # Do NOT silently swallow — surface the problem loud and clear.
+        print(f"[auto_entry] INVOICE QUERY FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
     kamai_by_site = {sid: 0.0 for sid in site_ids}
     for inv in invoice_rows:
         sid = getattr(inv, 'site_id', None)
         if sid in kamai_by_site:
-            kamai_by_site[sid] += float(inv.total_amount or 0)
+            amount = float(
+                getattr(inv, 'total_amount', None)
+                or getattr(inv, 'amount', None)
+                or 0
+            )
+            kamai_by_site[sid] += amount
             has_activity_by_site[sid] = True
+            print(f"[auto_entry] invoice {getattr(inv,'invoice_number','?')} "
+                  f"site={sid} amount={amount}")
 
-    # ------------------------------------------------------------------
-    # 4. OVERHEAD — daily share per site (only applied when site had activity)
-    # ------------------------------------------------------------------
+    # -------- 4. OVERHEAD — daily share per site --------
     overhead_per_site = _daily_overhead_for_site(entry_date, None, sites_count)
 
-    # ------------------------------------------------------------------
-    # 5. Assemble — SKIP sites with no activity
-    # ------------------------------------------------------------------
+    # -------- 5. Assemble — SKIP sites with no activity --------
     result = []
     for s in sites:
         sid = s.id
 
-        # ⬇️ KEY CHANGE: skip sites with no activity
         if not has_activity_by_site.get(sid):
             continue
 
-        kamai = round(kamai_by_site.get(sid, 0), 3)
-        labour = round(labour_by_site.get(sid, 0), 3)
-        one_time = round(one_time_by_site.get(sid, 0), 3)
-        material = round(material_by_site.get(sid, 0), 3)
+        kamai     = round(kamai_by_site.get(sid, 0), 3)
+        labour    = round(labour_by_site.get(sid, 0), 3)
+        one_time  = round(one_time_by_site.get(sid, 0), 3)
+        material  = round(material_by_site.get(sid, 0), 3)
         equipment = round(equipment_by_site.get(sid, 0), 3)
         transport = round(transport_by_site.get(sid, 0), 3)
-        other = round(other_by_site.get(sid, 0), 3)
-        overhead = round(overhead_per_site, 3)
+        other     = round(other_by_site.get(sid, 0), 3)
+        overhead  = round(overhead_per_site, 3)
 
         profit = (
             kamai - labour - overhead - one_time
@@ -161,20 +170,20 @@ def compute_auto_entries(entry_date, site_id=None):
         )
 
         result.append({
-            'date': entry_date.isoformat(),
-            'siteId': sid,
-            'siteName': s.name,
-            'kamai': kamai,
-            'labour': labour,
-            'overhead': overhead,
-            'oneTime': one_time,
-            'materialCost': material,
+            'date':          entry_date.isoformat(),
+            'siteId':        sid,
+            'siteName':      s.name,
+            'kamai':         kamai,
+            'labour':        labour,
+            'overhead':      overhead,
+            'oneTime':       one_time,
+            'materialCost':  material,
             'equipmentCost': equipment,
             'transportCost': transport,
-            'otherExpense': other,
-            'profit': round(profit, 3),
-            'source': 'auto',
-            'note': 'Auto-computed from attendance, expenses & invoices',
+            'otherExpense':  other,
+            'profit':        round(profit, 3),
+            'source':        'auto',
+            'note':          'Auto-computed from attendance, expenses & invoices',
         })
 
     return result
