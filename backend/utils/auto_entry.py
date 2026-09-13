@@ -9,7 +9,7 @@ Aggregates per (date, site):
   * equipment   ← expenses categorized as equipment
   * transport   ← expenses categorized as transport
   * other       ← any other non-recurring expense
-  * overhead    ← daily share of monthly overhead
+  * overhead    ← daily share of monthly overhead + recurring expenses
   * kamai       ← invoices issued on that date
 
 RULE: Only return a row for a site if there is at least one piece of real
@@ -95,6 +95,7 @@ def compute_auto_entries(entry_date, site_id=None):
     equipment_by_site = {sid: 0.0 for sid in site_ids}
     transport_by_site = {sid: 0.0 for sid in site_ids}
     other_by_site     = {sid: 0.0 for sid in site_ids}
+    recurring_by_site = {sid: 0.0 for sid in site_ids}   # NEW — feeds overhead
 
     for e in expense_rows:
         sid = e.site_id
@@ -102,6 +103,7 @@ def compute_auto_entries(entry_date, site_id=None):
             continue
         amount = float(e.amount or 0)
         cat = (e.category or '').lower()
+
         if cat in ('material', 'materials'):
             material_by_site[sid] += amount
         elif cat in ('equipment', 'machinery'):
@@ -109,10 +111,11 @@ def compute_auto_entries(entry_date, site_id=None):
         elif cat in ('transport', 'fuel', 'vehicle'):
             transport_by_site[sid] += amount
         elif e.is_recurring:
-            # Recurring expense — treated as part of overhead, skip
-            pass
+            # Recurring expense — folded into site overhead
+            recurring_by_site[sid] += amount
         else:
             one_time_by_site[sid] += amount
+
         has_activity_by_site[sid] = True
 
     # -------- 3. KAMAI — from invoices --------
@@ -145,6 +148,7 @@ def compute_auto_entries(entry_date, site_id=None):
                   f"site={sid} amount={amount}")
 
     # -------- 4. OVERHEAD — daily share per site --------
+    # Base overhead (monthly share) + any recurring expenses on this date.
     overhead_per_site = _daily_overhead_for_site(entry_date, None, sites_count)
 
     # -------- 5. Assemble — SKIP sites with no activity --------
@@ -155,6 +159,8 @@ def compute_auto_entries(entry_date, site_id=None):
         if not has_activity_by_site.get(sid):
             continue
 
+        recurring = recurring_by_site.get(sid, 0)
+
         kamai     = round(kamai_by_site.get(sid, 0), 3)
         labour    = round(labour_by_site.get(sid, 0), 3)
         one_time  = round(one_time_by_site.get(sid, 0), 3)
@@ -162,7 +168,7 @@ def compute_auto_entries(entry_date, site_id=None):
         equipment = round(equipment_by_site.get(sid, 0), 3)
         transport = round(transport_by_site.get(sid, 0), 3)
         other     = round(other_by_site.get(sid, 0), 3)
-        overhead  = round(overhead_per_site, 3)
+        overhead  = round(overhead_per_site + recurring, 3)   # recurring folded in
 
         profit = (
             kamai - labour - overhead - one_time
