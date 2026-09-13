@@ -1,7 +1,9 @@
+# routes/sites.py
 from flask import request, jsonify
 from models import Site, db
 from utils.helpers import generate_id
 from routes import sites_bp
+
 
 @sites_bp.route('', methods=['GET'])
 def get_sites():
@@ -13,6 +15,7 @@ def get_sites():
         print(f"Error in get_sites: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @sites_bp.route('/all', methods=['GET'])
 def get_all_sites_including_inactive():
     """Get all sites including inactive ones"""
@@ -22,6 +25,7 @@ def get_all_sites_including_inactive():
     except Exception as e:
         print(f"Error in get_all_sites: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 
 @sites_bp.route('', methods=['POST'])
 def create_site():
@@ -33,7 +37,7 @@ def create_site():
             name=data.get('name'),
             location=data.get('location', ''),
             manager=data.get('manager', ''),
-            manager_salary=float(data.get('managerSalary', 0)),
+            manager_salary=float(data.get('managerSalary', 0) or 0),
             phone=data.get('phone', ''),
             active=True
         )
@@ -44,6 +48,7 @@ def create_site():
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
 
+
 @sites_bp.route('/<site_id>', methods=['GET'])
 def get_site(site_id):
     """Get a specific site by ID"""
@@ -53,25 +58,27 @@ def get_site(site_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
+
 @sites_bp.route('/<site_id>', methods=['PUT'])
 def update_site(site_id):
     """Update a site"""
     try:
         site = Site.query.get_or_404(site_id)
         data = request.json
-        
+
         site.name = data.get('name', site.name)
         site.location = data.get('location', site.location)
         site.manager = data.get('manager', site.manager)
-        site.manager_salary = float(data.get('managerSalary', site.manager_salary))
+        site.manager_salary = float(data.get('managerSalary', site.manager_salary) or 0)
         site.phone = data.get('phone', site.phone)
         site.active = data.get('active', site.active)
-        
+
         db.session.commit()
         return jsonify(site.to_dict())
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
 
 @sites_bp.route('/<site_id>', methods=['DELETE'])
 def delete_site(site_id):
@@ -84,6 +91,7 @@ def delete_site(site_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
 
 @sites_bp.route('/<site_id>/permanent', methods=['DELETE'])
 def permanent_delete_site(site_id):
