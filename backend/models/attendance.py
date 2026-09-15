@@ -1,6 +1,7 @@
 # models/attendance.py
 from models import db
-from datetime import datetime
+from datetime import datetime, timezone
+
 
 class Attendance(db.Model):
     __tablename__ = 'attendance'
@@ -22,17 +23,18 @@ class Attendance(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Define relationship with Worker - use a unique backref name to avoid conflict
-    # Changed from backref='attendances' to backref='attendance_records'
     worker = db.relationship('Worker', backref='attendance_records', foreign_keys=[worker_id])
 
-    def to_dict(self):
+    # ⭐ Accepts site_name / worker_name from the caller to avoid N+1 queries
+    def to_dict(self, site_name=None, worker_name=None):
         return {
             'id': self.id,
             'workerId': self.worker_id,
-            'workerName': self.worker.name if self.worker else None,
+            'workerName': worker_name if worker_name is not None
+                          else (self.worker.name if self.worker else None),
             'teamId': self.team_id,
             'siteId': self.site_id,
+            'siteName': site_name,
             'date': self.date.isoformat() if self.date else None,
             'checkedIn': self.checked_in.isoformat() if self.checked_in else None,
             'checkedOut': self.checked_out.isoformat() if self.checked_out else None,
@@ -49,22 +51,45 @@ class Attendance(db.Model):
         }
 
     def calculate_hours(self):
-        """Calculate normal and overtime hours"""
+        """
+        Calculate normal and overtime hours.
+        Robust against mixed naive/aware datetimes.
+        Never returns negative values.
+        """
         if not self.checked_in or not self.checked_out:
             return
 
-        # Calculate total hours
-        total_seconds = (self.checked_out - self.checked_in).total_seconds()
+        checked_in = self.checked_in
+        checked_out = self.checked_out
+
+        # ⭐ Normalize both to naive UTC
+        if checked_in.tzinfo is not None:
+            checked_in = checked_in.astimezone(timezone.utc).replace(tzinfo=None)
+        if checked_out.tzinfo is not None:
+            checked_out = checked_out.astimezone(timezone.utc).replace(tzinfo=None)
+
+        total_seconds = (checked_out - checked_in).total_seconds()
+
+        # ⭐ Clamp negative (mixed timezones / bad data)
+        if total_seconds < 0:
+            self.total_hours = 0.0
+            self.normal_hours = 0.0
+            self.overtime_hours = 0.0
+            return
 
         # Subtract break time if exists
         if self.break_start and self.break_end:
-            break_seconds = (self.break_end - self.break_start).total_seconds()
-            total_seconds -= break_seconds
+            bs = self.break_start
+            be = self.break_end
+            if bs.tzinfo is not None:
+                bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
+            if be.tzinfo is not None:
+                be = be.astimezone(timezone.utc).replace(tzinfo=None)
+            total_seconds -= (be - bs).total_seconds()
 
-        total_hours = total_seconds / 3600
+        total_hours = max(0.0, total_seconds / 3600)
         self.total_hours = round(total_hours, 2)
 
-        # Calculate normal and overtime (assuming 8 hours normal)
         if total_hours > 8:
             self.normal_hours = 8.0
             self.overtime_hours = round(total_hours - 8, 2)
@@ -73,32 +98,42 @@ class Attendance(db.Model):
             self.overtime_hours = 0.0
 
     def calculate_wage(self):
-        """Calculate wage earned based on worker's hourly rate"""
+        """Calculate wage earned based on worker's hourly rate. Never negative."""
         if self.worker:
-            base_wage = self.normal_hours * self.worker.hourly_rate
-            overtime_wage = self.overtime_hours * self.worker.hourly_rate * 1.5
-            self.wage_earned = round(base_wage + overtime_wage, 2)
+            normal = max(0.0, self.normal_hours or 0.0)
+            overtime = max(0.0, self.overtime_hours or 0.0)
+            base_wage = normal * self.worker.hourly_rate
+            overtime_wage = overtime * self.worker.hourly_rate * 1.5
+            self.wage_earned = round(max(0.0, base_wage + overtime_wage), 2)
         return self.wage_earned
 
     def check_in(self, time=None):
-        """Check in the worker"""
-        self.checked_in = time or datetime.utcnow()
+        """Check in the worker. Always stores a naive UTC datetime."""
+        t = time or datetime.utcnow()
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        self.checked_in = t
         self.present = True
 
     def check_out(self, time=None):
-        """Check out the worker"""
-        self.checked_out = time or datetime.utcnow()
+        """Check out the worker. Always stores a naive UTC datetime."""
+        t = time or datetime.utcnow()
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        # ⭐ Guard: never earlier than checked_in
+        if self.checked_in and t < self.checked_in:
+            t = self.checked_in
+        self.checked_out = t
         self.calculate_hours()
         self.calculate_wage()
 
+    # ───────── Static query helpers ─────────
     @staticmethod
     def get_attendance_by_date(date):
-        """Get all attendance records for a specific date"""
         return Attendance.query.filter_by(date=date).all()
 
     @staticmethod
     def get_attendance_by_worker(worker_id, start_date=None, end_date=None):
-        """Get attendance records for a specific worker"""
         query = Attendance.query.filter_by(worker_id=worker_id)
         if start_date:
             query = query.filter(Attendance.date >= start_date)
@@ -108,7 +143,6 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_attendance_by_team(team_id, start_date=None, end_date=None):
-        """Get attendance records for all members of a team"""
         query = Attendance.query.filter_by(team_id=team_id)
         if start_date:
             query = query.filter(Attendance.date >= start_date)
@@ -118,7 +152,6 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_attendance_by_site(site_id, start_date=None, end_date=None):
-        """Get attendance records for a specific site"""
         query = Attendance.query.filter_by(site_id=site_id)
         if start_date:
             query = query.filter(Attendance.date >= start_date)
@@ -128,7 +161,6 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_attendance_by_date_range(start_date, end_date):
-        """Get attendance records for a date range"""
         return Attendance.query.filter(
             Attendance.date >= start_date,
             Attendance.date <= end_date
@@ -136,15 +168,14 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_attendance_summary(worker_id, start_date, end_date):
-        """Get attendance summary for a worker over a date range"""
         records = Attendance.get_attendance_by_worker(worker_id, start_date, end_date)
         total_days = (end_date - start_date).days + 1
         total_present = sum(1 for r in records if r.present)
-        total_hours = sum(r.total_hours or 0 for r in records)
-        total_wages = sum(r.wage_earned or 0 for r in records)
-        total_overtime = sum(r.overtime_hours or 0 for r in records)
+        # ⭐ Clamp negatives
+        total_hours = sum(max(0, r.total_hours or 0) for r in records)
+        total_wages = sum(max(0, r.wage_earned or 0) for r in records)
+        total_overtime = sum(max(0, r.overtime_hours or 0) for r in records)
 
-        # Get worker name
         from .worker import Worker
         worker = Worker.query.get(worker_id)
 
@@ -162,7 +193,6 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_team_attendance_summary(team_id, start_date, end_date):
-        """Get attendance summary for a team over a date range"""
         from .team import WorkerTeam
         from .worker import Worker
 
@@ -192,23 +222,32 @@ class Attendance(db.Model):
         total_days = (end_date - start_date).days + 1
         total_possible = len(worker_ids) * total_days
         total_present = sum(1 for r in records if r.present)
-        total_hours = sum(r.total_hours or 0 for r in records)
-        total_wages = sum(r.wage_earned or 0 for r in records)
+        # ⭐ Clamp negatives
+        total_hours = sum(max(0, r.total_hours or 0) for r in records)
+        total_wages = sum(max(0, r.wage_earned or 0) for r in records)
 
-        # Per worker summary
+        # ⭐ Group by worker in one pass — O(n) instead of O(n²)
+        by_worker = {}
+        for r in records:
+            by_worker.setdefault(r.worker_id, []).append(r)
+
+        workers = Worker.query.filter(Worker.id.in_(worker_ids)).all()
+        workers_map = {w.id: w for w in workers}
+
         worker_summary = []
         for worker_id in worker_ids:
-            worker_records = [r for r in records if r.worker_id == worker_id]
-            worker = Worker.query.get(worker_id)
+            worker_records = by_worker.get(worker_id, [])
+            worker = workers_map.get(worker_id)
             if worker:
+                present = sum(1 for r in worker_records if r.present)
                 worker_summary.append({
                     'worker_id': worker_id,
                     'worker_name': worker.name,
-                    'total_present': sum(1 for r in worker_records if r.present),
-                    'total_absent': total_days - sum(1 for r in worker_records if r.present),
-                    'total_hours': sum(r.total_hours or 0 for r in worker_records),
-                    'total_wages': sum(r.wage_earned or 0 for r in worker_records),
-                    'attendance_rate': (sum(1 for r in worker_records if r.present) / total_days * 100) if total_days > 0 else 0
+                    'total_present': present,
+                    'total_absent': total_days - present,
+                    'total_hours': sum(max(0, r.total_hours or 0) for r in worker_records),
+                    'total_wages': sum(max(0, r.wage_earned or 0) for r in worker_records),
+                    'attendance_rate': (present / total_days * 100) if total_days > 0 else 0
                 })
 
         return {
@@ -227,13 +266,11 @@ class Attendance(db.Model):
 
     @staticmethod
     def get_today_attendance():
-        """Get all attendance records for today"""
-        today = datetime.now().date()
+        today = datetime.utcnow().date()
         return Attendance.query.filter_by(date=today).all()
 
     @staticmethod
     def get_currently_working():
-        """Get all workers who are currently checked in but not checked out"""
         return Attendance.query.filter(
             Attendance.checked_in.isnot(None),
             Attendance.checked_out.is_(None)
