@@ -8,7 +8,7 @@ from routes import (
     sites_bp, workers_bp, teams_bp, entries_bp, 
     attendance_bp, expenses_bp, invoices_bp, items_bp,
     overhead_bp, cumulative_bp, summary_bp, settings_bp,projects_bp,clients_bp, equipment_bp,qc_bp, performance_bp,
-    leave_bp,inventory_bp, loans_bp, advances_bp  , auth_bp  
+    leave_bp,inventory_bp, loans_bp, advances_bp  , auth_bp, client_invoices_bp, units_bp
 )
 from sqlalchemy import text
 
@@ -55,6 +55,9 @@ app.register_blueprint(inventory_bp)
 app.register_blueprint(loans_bp)
 app.register_blueprint(advances_bp)
 app.register_blueprint(auth_bp) 
+app.register_blueprint(client_invoices_bp)
+app.register_blueprint(units_bp)
+
 # app.register_blueprint(dashboard_bp)
 # Health check routes
 @app.route('/')

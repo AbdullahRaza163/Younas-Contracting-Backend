@@ -4,6 +4,7 @@ from models import Worker, db
 from utils.helpers import generate_id
 from routes import workers_bp
 
+
 @workers_bp.route('', methods=['GET'])
 def get_workers():
     """Get all active workers"""
@@ -14,6 +15,7 @@ def get_workers():
         print(f"Error in get_workers: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
 @workers_bp.route('/all', methods=['GET'])
 def get_all_workers():
     """Get all workers including inactive"""
@@ -23,6 +25,7 @@ def get_all_workers():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 @workers_bp.route('', methods=['POST'])
 def create_worker():
     """Create a new worker"""
@@ -31,24 +34,37 @@ def create_worker():
         join_date = None
         if data.get('joinDate'):
             join_date = datetime.strptime(data.get('joinDate'), '%Y-%m-%d').date()
-        
+
+        # ⭐ Parse + clamp deduction percentage (0–100)
+        try:
+            deduction_percentage = float(data.get('deductionPercentage') or 0)
+        except (TypeError, ValueError):
+            deduction_percentage = 0.0
+        deduction_percentage = max(0.0, min(100.0, deduction_percentage))
+        deduction_enabled = bool(data.get('deductionEnabled', False))
+
         worker = Worker(
             id=generate_id(),
             name=data.get('name'),
             role=data.get('role', ''),
-            daily_rate=float(data.get('dailyRate', 0)),
-            hourly_rate=float(data.get('hourlyRate', 0)),
+            daily_rate=float(data.get('dailyRate') or 0),
+            hourly_rate=float(data.get('hourlyRate') or 0),
             phone=data.get('phone', ''),
             cpr=data.get('cpr', ''),
             join_date=join_date,
-            active=True
+            active=True,
+            # ⭐ NEW
+            deduction_percentage=deduction_percentage,
+            deduction_enabled=deduction_enabled,
         )
         db.session.add(worker)
         db.session.commit()
         return jsonify(worker.to_dict()), 201
     except Exception as e:
         db.session.rollback()
+        print(f"Error in create_worker: {str(e)}")
         return jsonify({'error': str(e)}), 400
+
 
 @workers_bp.route('/<worker_id>', methods=['GET'])
 def get_worker(worker_id):
@@ -59,30 +75,43 @@ def get_worker(worker_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 404
 
+
 @workers_bp.route('/<worker_id>', methods=['PUT'])
 def update_worker(worker_id):
     """Update a worker"""
     try:
         worker = Worker.query.get_or_404(worker_id)
         data = request.json
-        
+
         worker.name = data.get('name', worker.name)
         worker.role = data.get('role', worker.role)
-        worker.daily_rate = float(data.get('dailyRate', worker.daily_rate))
-        worker.hourly_rate = float(data.get('hourlyRate', worker.hourly_rate))
+        worker.daily_rate = float(data.get('dailyRate', worker.daily_rate) or 0)
+        worker.hourly_rate = float(data.get('hourlyRate', worker.hourly_rate) or 0)
         worker.phone = data.get('phone', worker.phone)
         worker.cpr = data.get('cpr', worker.cpr)
-        
+
         if data.get('joinDate'):
             worker.join_date = datetime.strptime(data.get('joinDate'), '%Y-%m-%d').date()
-        
+
         worker.active = data.get('active', worker.active)
-        
+
+        # ⭐ NEW: deduction fields
+        if 'deductionPercentage' in data:
+            try:
+                pct = float(data.get('deductionPercentage') or 0)
+            except (TypeError, ValueError):
+                pct = 0.0
+            worker.deduction_percentage = max(0.0, min(100.0, pct))
+        if 'deductionEnabled' in data:
+            worker.deduction_enabled = bool(data.get('deductionEnabled'))
+
         db.session.commit()
         return jsonify(worker.to_dict())
     except Exception as e:
         db.session.rollback()
+        print(f"Error in update_worker: {str(e)}")
         return jsonify({'error': str(e)}), 400
+
 
 @workers_bp.route('/<worker_id>', methods=['DELETE'])
 def delete_worker(worker_id):
@@ -95,6 +124,7 @@ def delete_worker(worker_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
+
 
 @workers_bp.route('/by-role/<role>', methods=['GET'])
 def get_workers_by_role(role):

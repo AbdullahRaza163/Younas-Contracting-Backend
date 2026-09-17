@@ -129,6 +129,10 @@ from .advance import (
     AdvanceRepayment, 
     AdvanceSalaryDeduction
 )
+from .attendance_settings import AttendanceSettings
+from .client_invoice import ClientInvoice
+from .unit import Unit
+
 # from models.dashboard import DashboardStats
 
 # ============================================
@@ -256,6 +260,9 @@ __all__ = [
     # Utility
     'generate_id',
     # 'DashboardStats',
+    'ClientInvoice',
+    'Unit',
+    'AttendanceSettings',
 ]
 
 

@@ -25,11 +25,17 @@ inventory_bp = Blueprint('inventory', __name__, url_prefix='/api/inventory')
 loans_bp = Blueprint('loans', __name__, url_prefix='/api/loans')
 advances_bp = Blueprint('advances', __name__, url_prefix='/api/advances')  # ← ADD THIS
 auth_bp = Blueprint('auth', __name__, url_prefix='/api')
+client_invoices_bp = Blueprint(
+    'client_invoices',
+    __name__,
+    url_prefix='/api/client-invoices'
+)
+units_bp = Blueprint('units', __name__, url_prefix='/api/units')
 # dashboard_bp = Blueprint('dashboard', __name__, url_prefix='/api/dashboard')
 # Import routes
 from routes import (
     sites, workers, teams, entries, attendance, expenses, invoices, items,
     overhead, cumulative, monthly_summary, settings, projects, budget_forecast,
     clients, equipment, quality_control, performance, leave, inventory, loans,
-    advances, auth  # ← ADD THIS
+    advances, auth , client_invoices, units # ← ADD THIS
 )
