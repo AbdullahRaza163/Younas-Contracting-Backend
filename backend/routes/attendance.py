@@ -42,27 +42,124 @@ def _month_bounds(month_str):
     return first, last
 
 
-def _recalc_record(record, worker=None):
+# ────────────────────────────────────────────
+# ⭐ Settings-aware recalculation
+# ────────────────────────────────────────────
+def _get_settings_dict():
+    """Load attendance settings as a plain dict — safe defaults if missing."""
+    defaults = {
+        'shift_hours': 8.0,
+        'break_enabled': True,
+        'break_hours': 1.0,
+        'overtime_enabled': True,
+        'overtime_rate': 1.5,
+    }
+    try:
+        s = AttendanceSettings.get_settings()
+        if not s:
+            return defaults
+        return {
+            'shift_hours': float(getattr(s, 'shift_hours', defaults['shift_hours']) or defaults['shift_hours']),
+            'break_enabled': bool(getattr(s, 'break_enabled', defaults['break_enabled'])),
+            'break_hours': float(getattr(s, 'break_hours', defaults['break_hours']) or 0),
+            'overtime_enabled': bool(getattr(s, 'overtime_enabled', defaults['overtime_enabled'])),
+            'overtime_rate': float(getattr(s, 'overtime_rate', defaults['overtime_rate']) or defaults['overtime_rate']),
+        }
+    except Exception as e:
+        print(f"[_get_settings_dict] falling back to defaults: {e}")
+        return defaults
+
+
+def _resolve_break_enabled(record, settings):
+    """Per-record override → global setting."""
+    v = getattr(record, 'break_enabled', None)
+    if v is not None:
+        return bool(v)
+    return bool(settings.get('break_enabled', True))
+
+
+def _resolve_overtime_enabled(record, settings):
+    """Per-record override → global setting."""
+    v = getattr(record, 'overtime_enabled', None)
+    if v is not None:
+        return bool(v)
+    return bool(settings.get('overtime_enabled', True))
+
+
+def _recalc_record(record, worker=None, settings=None):
     """
     Recompute hours + wage for a single attendance record.
-    Clamps negatives. Uses worker hourly_rate for wage.
+    Respects per-record break/overtime toggles → global settings.
+    Clamps negatives. Uses worker hourly_rate (falls back to daily_rate/shift_hours).
     """
-    if record.checked_in and record.checked_out:
-        record.calculate_hours()
-        if record.total_hours is not None and record.total_hours < 0:
-            record.total_hours = 0.0
-            record.normal_hours = 0.0
-            record.overtime_hours = 0.0
+    if settings is None:
+        settings = _get_settings_dict()
 
-        if worker is None:
-            worker = Worker.query.get(record.worker_id)
-        if worker:
-            record.wage_earned = record.calculate_wage()
-    else:
-        # Missing one side — no hours to compute
+    if not (record.checked_in and record.checked_out):
         record.total_hours = 0.0
         record.normal_hours = 0.0
         record.overtime_hours = 0.0
+        record.wage_earned = 0.0
+        return
+
+    # ── Compute raw hours (checked_out - checked_in) ──
+    ci = record.checked_in
+    co = record.checked_out
+    if ci.tzinfo is not None:
+        ci = ci.astimezone(timezone.utc).replace(tzinfo=None)
+    if co.tzinfo is not None:
+        co = co.astimezone(timezone.utc).replace(tzinfo=None)
+
+    total_seconds = (co - ci).total_seconds()
+    if total_seconds < 0:
+        total_seconds = 0
+
+    # ── Break subtraction (only if enabled) ──
+    break_enabled = _resolve_break_enabled(record, settings)
+    if break_enabled and record.break_start and record.break_end:
+        bs = record.break_start
+        be = record.break_end
+        if bs.tzinfo is not None:
+            bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
+        if be.tzinfo is not None:
+            be = be.astimezone(timezone.utc).replace(tzinfo=None)
+        break_seconds = (be - bs).total_seconds()
+        if break_seconds > 0:
+            total_seconds -= break_seconds
+
+    total_hours = max(0.0, total_seconds / 3600.0)
+    record.total_hours = round(total_hours, 2)
+
+    # ── Split normal / OT based on OT toggle & shift hours ──
+    overtime_enabled = _resolve_overtime_enabled(record, settings)
+    shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
+
+    if overtime_enabled and total_hours > shift_hours:
+        record.normal_hours = round(shift_hours, 2)
+        record.overtime_hours = round(total_hours - shift_hours, 2)
+    else:
+        record.normal_hours = round(total_hours, 2)
+        record.overtime_hours = 0.0
+
+    # ── Wage ──
+    if worker is None:
+        worker = Worker.query.get(record.worker_id)
+
+    if worker:
+        hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
+        if not hourly_rate:
+            daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
+            if daily_rate and shift_hours:
+                hourly_rate = daily_rate / shift_hours
+
+        base_wage = (record.normal_hours or 0) * hourly_rate
+        ot_rate = float(settings.get('overtime_rate', 1.5)) or 1.5
+        if overtime_enabled:
+            ot_wage = (record.overtime_hours or 0) * hourly_rate * ot_rate
+        else:
+            ot_wage = (record.overtime_hours or 0) * hourly_rate
+        record.wage_earned = round(max(0.0, base_wage + ot_wage), 2)
+    else:
         record.wage_earned = 0.0
 
 
@@ -163,6 +260,7 @@ def get_team_attendance(team_id):
             sites_map = {s.id: s.name for s in sites}
 
         att_by_worker = {r.worker_id: r for r in attendance_records}
+        settings = _get_settings_dict()
 
         result = []
         for worker in workers:
@@ -170,15 +268,28 @@ def get_team_attendance(team_id):
             hours = float(record.total_hours or 0) if record else 0
             if hours < 0:
                 hours = 0
+
+            # ⭐ Resolve per-record toggles for frontend (null = inherit)
+            break_enabled = None
+            overtime_enabled = None
+            if record:
+                break_enabled = getattr(record, 'break_enabled', None)
+                overtime_enabled = getattr(record, 'overtime_enabled', None)
+
             result.append({
                 'worker': worker.to_dict(),
                 'attendance': record.to_dict() if record else None,
                 'present': bool(record.present) if record else False,
                 'checkedIn': record.checked_in.isoformat() if record and record.checked_in else None,
                 'checkedOut': record.checked_out.isoformat() if record and record.checked_out else None,
+                'breakStart': record.break_start.isoformat() if record and record.break_start else None,
+                'breakEnd': record.break_end.isoformat() if record and record.break_end else None,
+                'breakEnabled': break_enabled,
+                'overtimeEnabled': overtime_enabled,
                 'hoursWorked': hours,
                 'wageEarned': float(record.wage_earned or 0) if record else 0,
                 'overtimeHours': float(record.overtime_hours or 0) if record else 0,
+                'normalHours': float(record.normal_hours or 0) if record else 0,
                 'siteId': record.site_id if record else None,
                 'siteName': sites_map.get(record.site_id) if record and record.site_id else None,
             })
@@ -289,6 +400,7 @@ def check_out_all_team(team_id):
 
         workers = Worker.query.filter(Worker.id.in_(worker_ids)).all()
         workers_map = {w.id: w for w in workers}
+        settings = _get_settings_dict()
 
         now = utc_now()
         for record in records:
@@ -299,18 +411,9 @@ def check_out_all_team(team_id):
             if record.checked_in and checkout_time < record.checked_in:
                 checkout_time = record.checked_in
             record.checked_out = checkout_time
-            record.calculate_hours()
 
-            if record.total_hours is not None and record.total_hours < 0:
-                record.total_hours = 0.0
-                record.normal_hours = 0.0
-                record.overtime_hours = 0.0
-
-            w = workers_map.get(record.worker_id)
-            if w:
-                base = (record.normal_hours or 0) * w.hourly_rate
-                ot = (record.overtime_hours or 0) * w.hourly_rate * 1.5
-                record.wage_earned = round(base + ot, 2)
+            # ⭐ Settings-aware recalculation
+            _recalc_record(record, workers_map.get(record.worker_id), settings)
 
         db.session.commit()
 
@@ -434,6 +537,14 @@ def create_attendance():
             notes=data.get('notes', '')
         )
 
+        # ⭐ Optional per-record toggles
+        if 'breakEnabled' in data:
+            v = data['breakEnabled']
+            record.break_enabled = None if v is None else bool(v)
+        if 'overtimeEnabled' in data:
+            v = data['overtimeEnabled']
+            record.overtime_enabled = None if v is None else bool(v)
+
         if checked_in and checked_out:
             worker = Worker.query.get(data.get('workerId'))
             _recalc_record(record, worker)
@@ -466,7 +577,8 @@ def get_attendance_record(attendance_id):
 def update_attendance(attendance_id):
     """
     Update an attendance record.
-    Accepts: checkedIn, checkedOut, breakStart, breakEnd, present, notes, siteId
+    Accepts: checkedIn, checkedOut, breakStart, breakEnd, present, notes, siteId,
+             breakEnabled, overtimeEnabled
     Recalculates hours + wage automatically.
     """
     try:
@@ -487,6 +599,14 @@ def update_attendance(attendance_id):
             record.notes = data['notes']
         if 'siteId' in data:
             record.site_id = data['siteId']
+
+        # ⭐ Per-record toggles
+        if 'breakEnabled' in data:
+            v = data['breakEnabled']
+            record.break_enabled = None if v is None else bool(v)
+        if 'overtimeEnabled' in data:
+            v = data['overtimeEnabled']
+            record.overtime_enabled = None if v is None else bool(v)
 
         # Normalize any aware datetimes
         for attr in ('checked_in', 'checked_out', 'break_start', 'break_end'):
@@ -519,46 +639,81 @@ def update_attendance(attendance_id):
 @attendance_bp.route('/<attendance_id>/edit-times', methods=['PUT'])
 def edit_attendance_times(attendance_id):
     """
-    Edit ONLY the check-in/check-out (and optional break) times.
+    Edit check-in/check-out/break times and/or toggle break/OT per-record.
     Recomputes hours + wage on save.
-    Body: { checkedIn?, checkedOut?, breakStart?, breakEnd? }
+
+    Body (all optional):
+      checkedIn?, checkedOut?, breakStart?, breakEnd?,
+      siteId?, notes?, present?,
+      breakEnabled?, overtimeEnabled?      ⭐ NEW
+
     Any field omitted is left unchanged.
-    Send null to clear a field.
+    Send null to clear a field. For breakEnabled/overtimeEnabled,
+    null = inherit global setting.
     """
     try:
         record = Attendance.query.get_or_404(attendance_id)
         data = request.json or {}
 
-        # Track changes
-        changes = {}
+        changes = []
 
-        # ---- checked_in
+        # ── checked_in
         if 'checkedIn' in data:
             new_in = parse_iso_utc(data['checkedIn']) if data['checkedIn'] else None
             if new_in != record.checked_in:
-                changes['checked_in'] = new_in
                 record.checked_in = new_in
+                changes.append('checkedIn')
 
-        # ---- checked_out
+        # ── checked_out
         if 'checkedOut' in data:
             new_out = parse_iso_utc(data['checkedOut']) if data['checkedOut'] else None
             if new_out != record.checked_out:
-                changes['checked_out'] = new_out
                 record.checked_out = new_out
+                changes.append('checkedOut')
 
-        # ---- break_start
+        # ── break_start
         if 'breakStart' in data:
             new_bs = parse_iso_utc(data['breakStart']) if data['breakStart'] else None
             if new_bs != record.break_start:
-                changes['break_start'] = new_bs
                 record.break_start = new_bs
+                changes.append('breakStart')
 
-        # ---- break_end
+        # ── break_end
         if 'breakEnd' in data:
             new_be = parse_iso_utc(data['breakEnd']) if data['breakEnd'] else None
             if new_be != record.break_end:
-                changes['break_end'] = new_be
                 record.break_end = new_be
+                changes.append('breakEnd')
+
+        # ── ⭐ break_enabled (per-record override)
+        if 'breakEnabled' in data:
+            v = data['breakEnabled']
+            new_val = None if v is None else bool(v)
+            if new_val != getattr(record, 'break_enabled', None):
+                record.break_enabled = new_val
+                changes.append('breakEnabled')
+
+        # ── ⭐ overtime_enabled (per-record override)
+        if 'overtimeEnabled' in data:
+            v = data['overtimeEnabled']
+            new_val = None if v is None else bool(v)
+            if new_val != getattr(record, 'overtime_enabled', None):
+                record.overtime_enabled = new_val
+                changes.append('overtimeEnabled')
+
+        # ── other fields
+        if 'siteId' in data:
+            if data['siteId'] != record.site_id:
+                record.site_id = data['siteId'] or None
+                changes.append('siteId')
+        if 'notes' in data:
+            if data['notes'] != record.notes:
+                record.notes = data['notes']
+                changes.append('notes')
+        if 'present' in data:
+            if bool(data['present']) != bool(record.present):
+                record.present = bool(data['present'])
+                changes.append('present')
 
         # Normalize any aware datetimes
         for attr in ('checked_in', 'checked_out', 'break_start', 'break_end'):
@@ -587,21 +742,24 @@ def edit_attendance_times(attendance_id):
                 'error': 'Break end cannot be later than check-out time'
             }), 400
 
-        # Recalculate
+        # ⭐ Recalculate (settings-aware)
         worker = Worker.query.get(record.worker_id)
         _recalc_record(record, worker)
 
+        record.updated_at = utc_now()
         db.session.commit()
         db.session.refresh(record)
 
         return jsonify({
             'message': 'Attendance times updated',
-            'changes': list(changes.keys()),
+            'changes': changes,
             'record': record.to_dict()
         })
     except Exception as e:
         db.session.rollback()
         print(f"Error in edit_attendance_times: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 400
 
 
@@ -651,6 +809,15 @@ def check_in():
             present=True,
             notes='Checked in via API'
         )
+
+        # ⭐ Optional per-record toggles
+        if 'breakEnabled' in data:
+            v = data['breakEnabled']
+            record.break_enabled = None if v is None else bool(v)
+        if 'overtimeEnabled' in data:
+            v = data['overtimeEnabled']
+            record.overtime_enabled = None if v is None else bool(v)
+
         db.session.add(record)
         db.session.commit()
         return jsonify(record.to_dict()), 201
@@ -677,16 +844,10 @@ def check_out(attendance_id):
         if record.checked_in and now < record.checked_in:
             now = record.checked_in
         record.checked_out = now
-        record.calculate_hours()
 
-        if record.total_hours is not None and record.total_hours < 0:
-            record.total_hours = 0.0
-            record.normal_hours = 0.0
-            record.overtime_hours = 0.0
-
+        # ⭐ Settings-aware recalculation
         worker = Worker.query.get(record.worker_id)
-        if worker:
-            record.wage_earned = record.calculate_wage()
+        _recalc_record(record, worker)
 
         db.session.commit()
         return jsonify(record.to_dict())
@@ -717,6 +878,10 @@ def get_salary_report(month):
         year, month_num = int(year), int(month_num)
         start, end = _month_bounds(month)
         days_in_month = monthrange(year, month_num)[1]
+
+        # ⭐ Load settings once
+        settings = _get_settings_dict()
+        ot_rate_cfg = float(settings.get('overtime_rate', 1.5)) or 1.5
 
         workers = Worker.query.filter_by(active=True).all()
         worker_ids = [w.id for w in workers]
@@ -776,7 +941,8 @@ def get_salary_report(month):
             hourly_rate = float(worker.hourly_rate or 0)
 
             basic_salary = normal_hours * hourly_rate
-            overtime_salary = overtime_hours * hourly_rate * 1.5
+            # ⭐ Use configured OT rate (per-record toggles already reflected in stored overtime_hours)
+            overtime_salary = overtime_hours * hourly_rate * ot_rate_cfg
             gross_salary = basic_salary + overtime_salary
 
             # ⭐ Percentage deduction
@@ -807,8 +973,11 @@ def get_salary_report(month):
                 'date': a.date.isoformat() if a.date else None,
                 'totalHours': max(0, float(a.total_hours or 0)),
                 'overtimeHours': max(0, float(a.overtime_hours or 0)),
+                'normalHours': max(0, float(a.normal_hours or 0)),
                 'present': bool(a.present),
                 'siteId': a.site_id,
+                'breakEnabled': getattr(a, 'break_enabled', None),
+                'overtimeEnabled': getattr(a, 'overtime_enabled', None),
             } for a in attendances]
 
             attendance_rate = (present_days / days_in_month * 100) if days_in_month else 0
@@ -925,6 +1094,8 @@ def update_attendance_settings():
         if 'breakStartTime' in data:  s.break_start_time = str(data['breakStartTime'])[:5]
         if 'breakEndTime' in data:    s.break_end_time   = str(data['breakEndTime'])[:5]
         if 'breakHours' in data:      s.break_hours      = max(0.0, float(data['breakHours']))
+        # ⭐ NEW — global break toggle
+        if 'breakEnabled' in data:    s.break_enabled    = bool(data['breakEnabled'])
 
         # Overtime
         if 'overtimeRate' in data:    s.overtime_rate    = max(1.0, float(data['overtimeRate']))
@@ -951,7 +1122,7 @@ def update_attendance_settings():
 
 
 # ============================================
-# HELPERS (must be at bottom — not inside other funcs)
+# HELPERS
 # ============================================
 def get_month_name(month_num):
     months = ['January', 'February', 'March', 'April', 'May', 'June',

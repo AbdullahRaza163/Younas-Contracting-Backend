@@ -16,32 +16,72 @@ RULE: Only return a row for a site if there is at least one piece of real
 activity that day (attendance, invoice, or expense). This prevents negative
 phantom entries on days with no work.
 """
+import calendar
 from datetime import datetime, date as date_cls
-from models import db, Attendance, Worker, Site, Expense, Invoice
+
+from models import db, Attendance, Worker, Site, Expense, Invoice, MonthlyOverhead
 
 
-def _daily_overhead_for_site(entry_date, site_id, sites_count):
-    """Daily overhead share for one site."""
+# ============================================
+# OVERHEAD HELPERS
+# ============================================
+def _days_in_month(entry_date):
+    try:
+        return calendar.monthrange(entry_date.year, entry_date.month)[1]
+    except Exception:
+        return 30
+
+
+def _resolve_overhead_for_site(entry_date, site_id, sites_count):
+    """
+    Return daily overhead (BD) for the given site/date.
+
+    Uses `calculate_daily_overhead` from utils.helpers, which now:
+      1. Prefers site-specific rows for that month
+      2. Falls back to global (site_id IS NULL) rows
+      3. Falls back to any row for the month (split across sites)
+      4. Falls back to Setting.monthly_overhead
+      5. Returns 0 (no phantom)
+    """
     try:
         from utils.helpers import calculate_daily_overhead
         month_key = entry_date.strftime('%Y-%m')
-        return float(calculate_daily_overhead(month_key, site_id) or 0)
+        return float(calculate_daily_overhead(month_key, site_id=site_id) or 0)
     except Exception as e:
-        print(f"[auto_entry] overhead fallback triggered: {e}")
-        from models import Setting
-        row = Setting.query.filter_by(key='monthly_overhead').first()
-        monthly = float(row.value) if row and row.value else 0.0
-        days_in_month = 30
+        print(f"[auto_entry] overhead failed for {site_id} on {entry_date}: {e}")
+        return 0.0
+
+
+def _resolve_global_daily_overhead(entry_date, active_sites_today):
+    """
+    When no site-specific row exists, we pull the global monthly overhead
+    once and split it across the sites that had activity today.
+    """
+    try:
+        from utils.helpers import calculate_daily_overhead
+        month_key = entry_date.strftime('%Y-%m')
+        n = max(1, len(active_sites_today))
+        # Passing site_id=None → global row path.
+        # Then divide the returned global daily total across today's active sites.
+        total_daily_global = float(
+            calculate_daily_overhead(month_key, site_id=None) or 0
+        )
+        # calculate_daily_overhead already divides by active_sites_count,
+        # so we scale it back up to the global total, then split by today's sites.
         try:
-            import calendar
-            days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
+            active_total = max(1, Site.query.filter_by(active=True).count() or 1)
         except Exception:
-            pass
-        if sites_count <= 0 or days_in_month <= 0:
-            return 0.0
-        return monthly / sites_count / days_in_month
+            active_total = 1
+        global_daily_total = total_daily_global * active_total
+        return global_daily_total / n
+    except Exception as e:
+        print(f"[auto_entry] global overhead failed: {e}")
+        return 0.0
 
 
+# ============================================
+# MAIN
+# ============================================
 def compute_auto_entries(entry_date, site_id=None):
     """
     Compute auto-entry values for a given date.
@@ -59,7 +99,6 @@ def compute_auto_entries(entry_date, site_id=None):
     if not sites:
         return []
 
-    sites_count = len(sites)
     site_ids = [s.id for s in sites]
 
     # -------- 1. LABOUR — from attendance --------
@@ -77,14 +116,18 @@ def compute_auto_entries(entry_date, site_id=None):
             worker = Worker.query.get(a.worker_id)
             if worker:
                 hours = (a.checked_out - a.checked_in).total_seconds() / 3600
-                if a.break_start and a.break_end:
+                # Respect break_enabled on the record
+                break_enabled = getattr(a, 'break_enabled', None)
+                if break_enabled is None:
+                    break_enabled = True  # default
+                if break_enabled and a.break_start and a.break_end:
                     hours -= (a.break_end - a.break_start).total_seconds() / 3600
                 hours = max(hours, 0)
                 wage = hours * float(worker.hourly_rate or 0)
         labour_by_site[a.site_id] = labour_by_site.get(a.site_id, 0) + wage
         has_activity_by_site[a.site_id] = True
 
-    # -------- 2. ONE-TIME / MATERIAL / EQUIPMENT / TRANSPORT / OTHER --------
+    # -------- 2. EXPENSES --------
     expense_rows = Expense.query.filter(
         Expense.date == entry_date,
         Expense.site_id.in_(site_ids),
@@ -116,15 +159,12 @@ def compute_auto_entries(entry_date, site_id=None):
         has_activity_by_site[sid] = True
 
     # -------- 3. KAMAI — from invoices --------
-    # ⚠️ CHECK: if your Invoice model uses `date` instead of `invoice_date`,
-    #           change the next line to: Invoice.date == entry_date
     try:
         invoice_rows = Invoice.query.filter(
             Invoice.invoice_date == entry_date,
             Invoice.site_id.in_(site_ids),
         ).all()
     except Exception as e:
-        # Do NOT silently swallow — surface the problem loud and clear.
         print(f"[auto_entry] INVOICE QUERY FAILED: {e}")
         import traceback
         traceback.print_exc()
@@ -141,17 +181,26 @@ def compute_auto_entries(entry_date, site_id=None):
             )
             kamai_by_site[sid] += amount
             has_activity_by_site[sid] = True
-            print(f"[auto_entry] invoice {getattr(inv,'invoice_number','?')} "
-                  f"site={sid} amount={amount}")
 
-    # -------- 4. OVERHEAD — daily share per site --------
-    overhead_per_site = _daily_overhead_for_site(entry_date, None, sites_count)
+    # -------- 4. OVERHEAD --------
+    # Determine which sites had activity today (these share the overhead)
+    active_sites_today = [sid for sid, has in has_activity_by_site.items() if has]
+    active_sites_count_today = max(1, len(active_sites_today))
+
+    overhead_by_site = {sid: 0.0 for sid in site_ids}
+
+    for sid in active_sites_today:
+        # First try a site-specific row for this month
+        oh = _resolve_overhead_for_site(entry_date, sid, active_sites_count_today)
+
+        # If the site row wasn't present, this returns the global total
+        # split by active sites. Either way, `oh` is the per-site amount now.
+        overhead_by_site[sid] = float(oh or 0)
 
     # -------- 5. Assemble — SKIP sites with no activity --------
     result = []
     for s in sites:
         sid = s.id
-
         if not has_activity_by_site.get(sid):
             continue
 
@@ -162,7 +211,7 @@ def compute_auto_entries(entry_date, site_id=None):
         equipment = round(equipment_by_site.get(sid, 0), 3)
         transport = round(transport_by_site.get(sid, 0), 3)
         other     = round(other_by_site.get(sid, 0), 3)
-        overhead  = round(overhead_per_site, 3)
+        overhead  = round(overhead_by_site.get(sid, 0), 3)
 
         profit = (
             kamai - labour - overhead - one_time
