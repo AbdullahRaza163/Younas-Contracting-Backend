@@ -208,6 +208,115 @@ class Attendance(db.Model):
 
         return self.wage_earned
 
+    # ────────────────────────────────────────────
+    # ⭐ Recompute from shifts (multi-site)
+    # ────────────────────────────────────────────
+    def recalc_from_shifts(self, settings=None):
+        """
+        Aggregate hours + wages across all `attendance_shifts`.
+        Uses each shift's own break/OT toggles (with global fallback).
+        Sums totals into this record's fields.
+        """
+        if settings is None:
+            settings = self._load_settings()
+
+        from models.attendance_shift import AttendanceShift
+        shifts = AttendanceShift.query.filter_by(attendance_id=self.id) \
+            .order_by(AttendanceShift.order_index).all()
+
+        if not shifts:
+            return  # keep legacy single-session values
+
+        shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
+        ot_rate = float(settings.get('overtime_rate', 1.5)) or 1.5
+        worker = self.worker
+
+        hourly_rate = 0.0
+        if worker:
+            hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
+            if not hourly_rate:
+                daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
+                if daily_rate and shift_hours:
+                    hourly_rate = daily_rate / shift_hours
+
+        # ── Step 1: compute each shift's raw totals ──
+        for sh in shifts:
+            sh_total_hours = 0.0
+            sh_normal = 0.0
+            sh_ot = 0.0
+
+            if sh.checked_in and sh.checked_out:
+                ci = sh.checked_in
+                co = sh.checked_out
+                if ci.tzinfo is not None:
+                    ci = ci.astimezone(timezone.utc).replace(tzinfo=None)
+                if co.tzinfo is not None:
+                    co = co.astimezone(timezone.utc).replace(tzinfo=None)
+
+                raw = (co - ci).total_seconds()
+                if raw < 0:
+                    raw = 0
+
+                break_enabled = sh.break_enabled if sh.break_enabled is not None \
+                    else settings.get('break_enabled', True)
+                if break_enabled and sh.break_start and sh.break_end:
+                    bs = sh.break_start
+                    be = sh.break_end
+                    if bs.tzinfo is not None:
+                        bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
+                    if be.tzinfo is not None:
+                        be = be.astimezone(timezone.utc).replace(tzinfo=None)
+                    bs_sec = (be - bs).total_seconds()
+                    if bs_sec > 0:
+                        raw -= bs_sec
+
+                sh_total_hours = max(0.0, raw / 3600)
+
+                ot_enabled = sh.overtime_enabled if sh.overtime_enabled is not None \
+                    else settings.get('overtime_enabled', True)
+
+                if ot_enabled and sh_total_hours > shift_hours:
+                    sh_normal = shift_hours
+                    sh_ot = sh_total_hours - shift_hours
+                else:
+                    sh_normal = sh_total_hours
+                    sh_ot = 0.0
+
+            # Wage for this shift
+            base_wage = sh_normal * hourly_rate
+            if (sh.overtime_enabled if sh.overtime_enabled is not None
+                    else settings.get('overtime_enabled', True)):
+                ot_wage = sh_ot * hourly_rate * ot_rate
+            else:
+                ot_wage = sh_ot * hourly_rate
+
+            sh.normal_hours = round(sh_normal, 2)
+            sh.overtime_hours = round(sh_ot, 2)
+            sh.total_hours = round(sh_total_hours, 2)
+            sh.wage_earned = round(max(0.0, base_wage + ot_wage), 2)
+
+        # ── Step 2: aggregate into the parent record ──
+        self.total_hours = round(sum(s.total_hours or 0 for s in shifts), 2)
+        self.normal_hours = round(sum(s.normal_hours or 0 for s in shifts), 2)
+        self.overtime_hours = round(sum(s.overtime_hours or 0 for s in shifts), 2)
+        self.wage_earned = round(sum(s.wage_earned or 0 for s in shifts), 2)
+
+        # Mirror overall clock-in/out for legacy consumers
+        if shifts:
+            first_in = next((s.checked_in for s in shifts if s.checked_in), None)
+            last_out = None
+            for s in shifts:
+                if s.checked_out and (last_out is None or s.checked_out > last_out):
+                    last_out = s.checked_out
+            if first_in:
+                self.checked_in = first_in
+            if last_out:
+                self.checked_out = last_out
+            # Primary site = biggest shift
+            biggest = max(shifts, key=lambda s: s.total_hours or 0)
+            if biggest.site_id:
+                self.site_id = biggest.site_id
+
     # ───────── Clock in / out ─────────
     def check_in(self, time=None):
         """Check in the worker. Always stores a naive UTC datetime."""

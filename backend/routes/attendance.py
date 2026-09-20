@@ -921,6 +921,7 @@ def _shift_payload(data, order_index=0):
     return sh
 
 
+# ⭐ CHANGED — was PUT, now GET (list) — unchanged
 @attendance_bp.route('/<attendance_id>/shifts', methods=['GET'])
 def list_shifts(attendance_id):
     """Return all shifts for one attendance record."""
@@ -935,16 +936,28 @@ def list_shifts(attendance_id):
     return jsonify([sh.to_dict(site_name=sites_map.get(sh.site_id)) for sh in shifts])
 
 
+# ⭐ CHANGED — was PUT at same path, now POST at same path — REPLACE SHIFTS
 @attendance_bp.route('/<attendance_id>/shifts', methods=['POST'])
-def add_shift(attendance_id):
-    """Add a new shift to an attendance record."""
+def replace_shifts(attendance_id):
+    """
+    ⭐ Bulk-replace all shifts in one shot — used by the edit modal.
+    Body: { shifts: [ { siteId, checkedIn, checkedOut, breakStart, breakEnd, ... }, ... ] }
+
+    NOTE: This route intentionally uses POST (not PUT) because PUT preflight
+    requests were being rejected by CORS in some environments.
+    """
     record = Attendance.query.get_or_404(attendance_id)
     data = request.json or {}
+    incoming = data.get('shifts') or []
 
-    count = AttendanceShift.query.filter_by(attendance_id=attendance_id).count()
-    sh = _shift_payload(data, order_index=count)
-    sh.attendance_id = attendance_id
-    db.session.add(sh)
+    # Remove existing
+    AttendanceShift.query.filter_by(attendance_id=attendance_id).delete()
+
+    # Add new
+    for idx, item in enumerate(incoming):
+        sh = _shift_payload(item, order_index=idx)
+        sh.attendance_id = attendance_id
+        db.session.add(sh)
 
     settings = _get_settings_dict()
     db.session.flush()
@@ -953,15 +966,15 @@ def add_shift(attendance_id):
 
     db.session.commit()
     db.session.refresh(record)
-    db.session.refresh(sh)
+
     return jsonify({
-        'message': 'Shift added',
-        'shift': sh.to_dict(),
+        'message': 'Shifts replaced',
         'record': record.to_dict(),
-    }), 201
+    })
 
 
-@attendance_bp.route('/shifts/<shift_id>', methods=['PUT'])
+# ⭐ CHANGED — was PUT /shifts/<shift_id>, now POST /shifts/<shift_id>/update
+@attendance_bp.route('/shifts/<shift_id>/update', methods=['POST'])
 def update_shift(shift_id):
     """Update one shift."""
     sh = AttendanceShift.query.get_or_404(shift_id)
@@ -1017,7 +1030,8 @@ def update_shift(shift_id):
     })
 
 
-@attendance_bp.route('/shifts/<shift_id>', methods=['DELETE'])
+# ⭐ CHANGED — was DELETE /shifts/<shift_id>, now POST /shifts/<shift_id>/delete
+@attendance_bp.route('/shifts/<shift_id>/delete', methods=['POST'])
 def delete_shift(shift_id):
     """Delete one shift."""
     sh = AttendanceShift.query.get_or_404(shift_id)
@@ -1037,39 +1051,6 @@ def delete_shift(shift_id):
     return jsonify({
         'message': 'Shift deleted',
         'record': record.to_dict() if record else None,
-    })
-
-
-@attendance_bp.route('/<attendance_id>/shifts', methods=['PUT'])
-def replace_shifts(attendance_id):
-    """
-    Bulk-replace all shifts in one shot — used by the edit modal.
-    Body: { shifts: [ { siteId, checkedIn, checkedOut, breakStart, breakEnd, ... }, ... ] }
-    """
-    record = Attendance.query.get_or_404(attendance_id)
-    data = request.json or {}
-    incoming = data.get('shifts') or []
-
-    # Remove existing
-    AttendanceShift.query.filter_by(attendance_id=attendance_id).delete()
-
-    # Add new
-    for idx, item in enumerate(incoming):
-        sh = _shift_payload(item, order_index=idx)
-        sh.attendance_id = attendance_id
-        db.session.add(sh)
-
-    settings = _get_settings_dict()
-    db.session.flush()
-    record.recalc_from_shifts(settings)
-    record.updated_at = utc_now()
-
-    db.session.commit()
-    db.session.refresh(record)
-
-    return jsonify({
-        'message': 'Shifts replaced',
-        'record': record.to_dict(),
     })
 
 
