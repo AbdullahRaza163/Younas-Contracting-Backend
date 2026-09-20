@@ -132,7 +132,7 @@ from .advance import (
 from .attendance_settings import AttendanceSettings
 from .client_invoice import ClientInvoice
 from .unit import Unit
-
+from models.attendance_shift import AttendanceShift
 # from models.dashboard import DashboardStats
 
 # ============================================
@@ -263,6 +263,7 @@ __all__ = [
     'ClientInvoice',
     'Unit',
     'AttendanceSettings',
+    'AttendanceShift',
 ]
 
 
