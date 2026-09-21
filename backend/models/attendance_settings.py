@@ -17,10 +17,15 @@ class AttendanceSettings(db.Model):
     break_start_time  = db.Column(db.String(5), default='12:00')   # HH:MM
     break_end_time    = db.Column(db.String(5), default='13:00')   # HH:MM
     break_hours       = db.Column(db.Float, default=1.0)           # hours
-    break_enabled     = db.Column(db.Boolean, default=True, nullable=False)  # ⭐ NEW
+    break_enabled     = db.Column(db.Boolean, default=True, nullable=False)
 
     # ---------- Overtime ----------
-    overtime_rate     = db.Column(db.Float, default=1.5)           # multiplier
+    # ⭐ Set from the frontend Settings tab:
+    #     1.0  → no premium (all OT hours paid at normal rate)
+    #     1.5  → standard premium
+    #     2.0  → double rate
+    #     any other multiplier
+    overtime_rate     = db.Column(db.Float, default=1.0)           # multiplier
     overtime_enabled  = db.Column(db.Boolean, default=True, nullable=False)
 
     # ---------- Thresholds (minutes) ----------
@@ -46,9 +51,10 @@ class AttendanceSettings(db.Model):
             'breakStartTime':   self.break_start_time,
             'breakEndTime':     self.break_end_time,
             'breakHours':       float(self.break_hours or 1.0),
-            'breakEnabled':     bool(self.break_enabled),    # ⭐ NEW
+            'breakEnabled':     bool(self.break_enabled),
 
-            'overtimeRate':     float(self.overtime_rate or 1.5),
+            # ⭐ Fall back to 1.0 (not 1.5) if DB value is missing
+            'overtimeRate':     float(self.overtime_rate if self.overtime_rate is not None else 1.0),
             'overtimeEnabled':  bool(self.overtime_enabled),
 
             'earlyInThreshold':  int(self.early_in_threshold or 15),

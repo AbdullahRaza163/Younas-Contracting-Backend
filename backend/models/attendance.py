@@ -31,15 +31,61 @@ class Attendance(db.Model):
     worker = db.relationship('Worker', backref='attendance_records', foreign_keys=[worker_id])
 
     # ⭐ Accepts site_name / worker_name from the caller to avoid N+1 queries
+    # ⭐ Also exposes the full shifts array for multi-site days
     def to_dict(self, site_name=None, worker_name=None):
+        # ── Build the shifts array ──
+        shift_list = []
+        try:
+            from models.attendance_shift import AttendanceShift
+            from models.site import Site
+
+            shifts = AttendanceShift.query.filter_by(attendance_id=self.id) \
+                .order_by(AttendanceShift.order_index).all()
+
+            # Batch-load site names to avoid N+1
+            site_ids = {s.site_id for s in shifts if s.site_id}
+            sites_map = {}
+            if site_ids:
+                for s in Site.query.filter(Site.id.in_(site_ids)).all():
+                    sites_map[s.id] = s.name
+
+            shift_list = [
+                s.to_dict(site_name=sites_map.get(s.site_id))
+                for s in shifts
+            ]
+        except Exception as e:
+            print(f"[Attendance.to_dict] failed to load shifts: {e}")
+
+        has_shifts = len(shift_list) > 0
+
+        # ── Aggregate hours + wages from shifts when they exist ──
+        if has_shifts:
+            agg_total = round(sum(s.get('totalHours') or 0 for s in shift_list), 2)
+            agg_normal = round(sum(s.get('normalHours') or 0 for s in shift_list), 2)
+            agg_ot = round(sum(s.get('overtimeHours') or 0 for s in shift_list), 2)
+            agg_wage = round(sum(s.get('wageEarned') or 0 for s in shift_list), 2)
+        else:
+            agg_total = self.total_hours
+            agg_normal = self.normal_hours
+            agg_ot = self.overtime_hours
+            agg_wage = self.wage_earned
+
+        # ── Primary site = the biggest shift ──
+        primary_site_id = self.site_id
+        primary_site_name = site_name
+        if has_shifts:
+            biggest = max(shift_list, key=lambda s: s.get('totalHours') or 0)
+            primary_site_id = biggest.get('siteId') or primary_site_id
+            primary_site_name = biggest.get('siteName') or primary_site_name
+
         return {
             'id': self.id,
             'workerId': self.worker_id,
             'workerName': worker_name if worker_name is not None
                           else (self.worker.name if self.worker else None),
             'teamId': self.team_id,
-            'siteId': self.site_id,
-            'siteName': site_name,
+            'siteId': primary_site_id,
+            'siteName': primary_site_name,
             'date': self.date.isoformat() if self.date else None,
             'checkedIn': self.checked_in.isoformat() if self.checked_in else None,
             'checkedOut': self.checked_out.isoformat() if self.checked_out else None,
@@ -49,11 +95,15 @@ class Attendance(db.Model):
             # ⭐ null means inherit global setting
             'breakEnabled': self.break_enabled,
             'overtimeEnabled': self.overtime_enabled,
-            'overtimeHours': self.overtime_hours,
-            'normalHours': self.normal_hours,
-            'totalHours': self.total_hours,
-            'wageEarned': self.wage_earned,
+            'overtimeHours': agg_ot,
+            'normalHours': agg_normal,
+            'totalHours': agg_total,
+            'wageEarned': agg_wage,
             'notes': self.notes,
+            # ⭐ Multi-site
+            'shifts': shift_list,
+            'hasShifts': has_shifts,
+            'siteCount': len(shift_list),
             'createdAt': self.created_at.isoformat() if self.created_at else None,
             'updatedAt': self.updated_at.isoformat() if self.updated_at else None
         }
@@ -73,7 +123,7 @@ class Attendance(db.Model):
             'break_start_time': None,
             'break_end_time': None,
             'overtime_enabled': True,
-            'overtime_rate': 1.5,
+            'overtime_rate': 1.0,          # ⭐ was 1.5 — now 1.0 (no premium by default)
         }
         try:
             from models.attendance_settings import AttendanceSettings
@@ -176,7 +226,7 @@ class Attendance(db.Model):
         """
         Calculate wage earned based on worker's hourly rate.
         - Respects overtime_enabled (per-record → global).
-        - Uses overtime_rate from settings (not hardcoded 1.5).
+        - Uses overtime_rate from settings (configurable, default 1.0).
         - Never negative.
         """
         if settings is None:
@@ -197,7 +247,7 @@ class Attendance(db.Model):
             base_wage = normal * hourly_rate
 
             overtime_enabled = self._resolve_overtime_enabled(settings)
-            ot_rate = float(settings.get('overtime_rate', 1.5)) or 1.5
+            ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
             if overtime_enabled:
                 overtime_wage = overtime * hourly_rate * ot_rate
             else:
@@ -207,6 +257,115 @@ class Attendance(db.Model):
             self.wage_earned = round(max(0.0, base_wage + overtime_wage), 2)
 
         return self.wage_earned
+
+    # ────────────────────────────────────────────
+    # ⭐ Recompute from shifts (multi-site)
+    # ────────────────────────────────────────────
+    def recalc_from_shifts(self, settings=None):
+        """
+        Aggregate hours + wages across all `attendance_shifts`.
+        Uses each shift's own break/OT toggles (with global fallback).
+        Sums totals into this record's fields.
+        """
+        if settings is None:
+            settings = self._load_settings()
+
+        from models.attendance_shift import AttendanceShift
+        shifts = AttendanceShift.query.filter_by(attendance_id=self.id) \
+            .order_by(AttendanceShift.order_index).all()
+
+        if not shifts:
+            return  # keep legacy single-session values
+
+        shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
+        ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
+        worker = self.worker
+
+        hourly_rate = 0.0
+        if worker:
+            hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
+            if not hourly_rate:
+                daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
+                if daily_rate and shift_hours:
+                    hourly_rate = daily_rate / shift_hours
+
+        # ── Step 1: compute each shift's raw totals ──
+        for sh in shifts:
+            sh_total_hours = 0.0
+            sh_normal = 0.0
+            sh_ot = 0.0
+
+            if sh.checked_in and sh.checked_out:
+                ci = sh.checked_in
+                co = sh.checked_out
+                if ci.tzinfo is not None:
+                    ci = ci.astimezone(timezone.utc).replace(tzinfo=None)
+                if co.tzinfo is not None:
+                    co = co.astimezone(timezone.utc).replace(tzinfo=None)
+
+                raw = (co - ci).total_seconds()
+                if raw < 0:
+                    raw = 0
+
+                break_enabled = sh.break_enabled if sh.break_enabled is not None \
+                    else settings.get('break_enabled', True)
+                if break_enabled and sh.break_start and sh.break_end:
+                    bs = sh.break_start
+                    be = sh.break_end
+                    if bs.tzinfo is not None:
+                        bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
+                    if be.tzinfo is not None:
+                        be = be.astimezone(timezone.utc).replace(tzinfo=None)
+                    bs_sec = (be - bs).total_seconds()
+                    if bs_sec > 0:
+                        raw -= bs_sec
+
+                sh_total_hours = max(0.0, raw / 3600)
+
+                ot_enabled = sh.overtime_enabled if sh.overtime_enabled is not None \
+                    else settings.get('overtime_enabled', True)
+
+                if ot_enabled and sh_total_hours > shift_hours:
+                    sh_normal = shift_hours
+                    sh_ot = sh_total_hours - shift_hours
+                else:
+                    sh_normal = sh_total_hours
+                    sh_ot = 0.0
+
+            # Wage for this shift
+            base_wage = sh_normal * hourly_rate
+            if (sh.overtime_enabled if sh.overtime_enabled is not None
+                    else settings.get('overtime_enabled', True)):
+                ot_wage = sh_ot * hourly_rate * ot_rate
+            else:
+                ot_wage = sh_ot * hourly_rate
+
+            sh.normal_hours = round(sh_normal, 2)
+            sh.overtime_hours = round(sh_ot, 2)
+            sh.total_hours = round(sh_total_hours, 2)
+            sh.wage_earned = round(max(0.0, base_wage + ot_wage), 2)
+
+        # ── Step 2: aggregate into the parent record ──
+        self.total_hours = round(sum(s.total_hours or 0 for s in shifts), 2)
+        self.normal_hours = round(sum(s.normal_hours or 0 for s in shifts), 2)
+        self.overtime_hours = round(sum(s.overtime_hours or 0 for s in shifts), 2)
+        self.wage_earned = round(sum(s.wage_earned or 0 for s in shifts), 2)
+
+        # Mirror overall clock-in/out for legacy consumers
+        if shifts:
+            first_in = next((s.checked_in for s in shifts if s.checked_in), None)
+            last_out = None
+            for s in shifts:
+                if s.checked_out and (last_out is None or s.checked_out > last_out):
+                    last_out = s.checked_out
+            if first_in:
+                self.checked_in = first_in
+            if last_out:
+                self.checked_out = last_out
+            # Primary site = biggest shift
+            biggest = max(shifts, key=lambda s: s.total_hours or 0)
+            if biggest.site_id:
+                self.site_id = biggest.site_id
 
     # ───────── Clock in / out ─────────
     def check_in(self, time=None):
