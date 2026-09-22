@@ -19,18 +19,44 @@ def utc_now():
 
 
 def parse_iso_utc(value):
+    """
+    Parse an ISO string (or datetime) into a NAIVE UTC datetime.
+    Handles trailing 'Z', explicit offsets, and naive strings.
+    """
     if not value:
         return None
     if isinstance(value, datetime):
         dt = value
     else:
-        s = value
+        s = str(value).strip()
         if s.endswith('Z'):
             s = s[:-1] + '+00:00'
-        dt = datetime.fromisoformat(s)
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S',
+                        '%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M'):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+def _to_naive_utc(dt):
+    """Coerce an aware datetime → naive UTC. Naive stays as-is."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
 
 def _month_bounds(month_str):
     """Return (start_date, end_date) for 'YYYY-MM'."""
@@ -50,7 +76,7 @@ def _get_settings_dict():
         'break_enabled': True,
         'break_hours': 1.0,
         'overtime_enabled': True,
-        'overtime_rate': 1.0,          # ⭐ was 1.5 — now 1.0 (no premium by default)
+        'overtime_rate': 1.0,
     }
     try:
         s = AttendanceSettings.get_settings()
@@ -69,7 +95,6 @@ def _get_settings_dict():
 
 
 def _resolve_break_enabled(record, settings):
-    """Per-record override → global setting."""
     v = getattr(record, 'break_enabled', None)
     if v is not None:
         return bool(v)
@@ -77,18 +102,46 @@ def _resolve_break_enabled(record, settings):
 
 
 def _resolve_overtime_enabled(record, settings):
-    """Per-record override → global setting."""
     v = getattr(record, 'overtime_enabled', None)
     if v is not None:
         return bool(v)
     return bool(settings.get('overtime_enabled', True))
 
 
+def _resolve_hourly_rate(worker, shift_hours):
+    """
+    Effective hourly rate.
+
+    ⭐ Single-field setup: your Workers module has ONE rate field
+    that you intend as an HOURLY rate. The backend stores it in
+    `daily_rate` (legacy column name). We therefore treat `daily_rate`
+    AS-IS — no division by shift_hours.
+
+    Priority:
+      1. worker.hourly_rate (if > 0)  → use directly
+      2. worker.daily_rate  (if > 0)  → use directly (it IS the hourly rate)
+      3. 0
+    """
+    if not worker:
+        return 0.0
+    hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
+    if hourly_rate > 0:
+        return hourly_rate
+    daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
+    if daily_rate > 0:
+        return daily_rate
+    return 0.0
+
+
+def _has_shifts(record_id):
+    """Return True if the attendance record has any shifts."""
+    from models.attendance_shift import AttendanceShift
+    return AttendanceShift.query.filter_by(attendance_id=record_id).first() is not None
+
+
 def _recalc_record(record, worker=None, settings=None):
     """
-    Recompute hours + wage for a single attendance record.
-    Respects per-record break/overtime toggles → global settings.
-    Clamps negatives. Uses worker hourly_rate (falls back to daily_rate/shift_hours).
+    Recompute hours + wage for a single attendance record (LEGACY / no shifts).
     """
     if settings is None:
         settings = _get_settings_dict()
@@ -100,65 +153,70 @@ def _recalc_record(record, worker=None, settings=None):
         record.wage_earned = 0.0
         return
 
-    # ── Compute raw hours (checked_out - checked_in) ──
-    ci = record.checked_in
-    co = record.checked_out
-    if ci.tzinfo is not None:
-        ci = ci.astimezone(timezone.utc).replace(tzinfo=None)
-    if co.tzinfo is not None:
-        co = co.astimezone(timezone.utc).replace(tzinfo=None)
+    ci = _to_naive_utc(record.checked_in)
+    co = _to_naive_utc(record.checked_out)
 
     total_seconds = (co - ci).total_seconds()
     if total_seconds < 0:
         total_seconds = 0
 
-    # ── Break subtraction (only if enabled) ──
+    # ── Break subtraction ──
     break_enabled = _resolve_break_enabled(record, settings)
-    if break_enabled and record.break_start and record.break_end:
-        bs = record.break_start
-        be = record.break_end
-        if bs.tzinfo is not None:
-            bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
-        if be.tzinfo is not None:
-            be = be.astimezone(timezone.utc).replace(tzinfo=None)
-        break_seconds = (be - bs).total_seconds()
-        if break_seconds > 0:
-            total_seconds -= break_seconds
+    if break_enabled:
+        if record.break_start and record.break_end:
+            bs = _to_naive_utc(record.break_start)
+            be = _to_naive_utc(record.break_end)
+            break_seconds = (be - bs).total_seconds()
+            if break_seconds > 0:
+                total_seconds -= break_seconds
+        else:
+            # ⭐ fallback to configured break_hours
+            cfg_break_hours = float(settings.get('break_hours', 0) or 0)
+            if cfg_break_hours > 0:
+                total_seconds -= cfg_break_hours * 3600.0
 
     total_hours = max(0.0, total_seconds / 3600.0)
     record.total_hours = round(total_hours, 2)
 
-    # ── Split normal / OT based on OT toggle & shift hours ──
+    # ── Split normal / OT ──
     overtime_enabled = _resolve_overtime_enabled(record, settings)
     shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
 
-    if overtime_enabled and total_hours > shift_hours:
+    rounded_total = record.total_hours
+    if overtime_enabled and rounded_total > shift_hours:
         record.normal_hours = round(shift_hours, 2)
-        record.overtime_hours = round(total_hours - shift_hours, 2)
+        record.overtime_hours = round(rounded_total - shift_hours, 2)
     else:
-        record.normal_hours = round(total_hours, 2)
+        record.normal_hours = round(rounded_total, 2)
         record.overtime_hours = 0.0
 
     # ── Wage ──
     if worker is None:
         worker = Worker.query.get(record.worker_id)
 
-    if worker:
-        hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
-        if not hourly_rate:
-            daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
-            if daily_rate and shift_hours:
-                hourly_rate = daily_rate / shift_hours
+    hourly_rate = _resolve_hourly_rate(worker, shift_hours)
+    ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0
 
-        base_wage = (record.normal_hours or 0) * hourly_rate
-        ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
-        if overtime_enabled:
-            ot_wage = (record.overtime_hours or 0) * hourly_rate * ot_rate
-        else:
-            ot_wage = (record.overtime_hours or 0) * hourly_rate
-        record.wage_earned = round(max(0.0, base_wage + ot_wage), 2)
+    base_wage = (record.normal_hours or 0) * hourly_rate
+    if overtime_enabled:
+        ot_wage = (record.overtime_hours or 0) * hourly_rate * ot_rate
     else:
-        record.wage_earned = 0.0
+        ot_wage = 0.0
+
+    record.wage_earned = round(max(0.0, base_wage + ot_wage), 3)
+
+
+def _recalc_record_smart(record, worker=None, settings=None):
+    """
+    ⭐ Smart recalc: uses recalc_from_shifts when shifts exist,
+    otherwise falls back to legacy _recalc_record.
+    """
+    if settings is None:
+        settings = _get_settings_dict()
+    if _has_shifts(record.id):
+        record.recalc_from_shifts(settings)
+    else:
+        _recalc_record(record, worker, settings)
 
 
 # ============================================
@@ -258,7 +316,6 @@ def get_team_attendance(team_id):
             sites_map = {s.id: s.name for s in sites}
 
         att_by_worker = {r.worker_id: r for r in attendance_records}
-        settings = _get_settings_dict()
 
         result = []
         for worker in workers:
@@ -267,7 +324,6 @@ def get_team_attendance(team_id):
             if hours < 0:
                 hours = 0
 
-            # ⭐ Resolve per-record toggles for frontend (null = inherit)
             break_enabled = None
             overtime_enabled = None
             if record:
@@ -402,16 +458,15 @@ def check_out_all_team(team_id):
 
         now = utc_now()
         for record in records:
-            if record.checked_in and record.checked_in.tzinfo is not None:
-                record.checked_in = record.checked_in.astimezone(timezone.utc).replace(tzinfo=None)
+            record.checked_in = _to_naive_utc(record.checked_in)
 
             checkout_time = now
             if record.checked_in and checkout_time < record.checked_in:
                 checkout_time = record.checked_in
             record.checked_out = checkout_time
 
-            # ⭐ Settings-aware recalculation
-            _recalc_record(record, workers_map.get(record.worker_id), settings)
+            # ⭐ Smart recalc — uses shifts when they exist
+            _recalc_record_smart(record, workers_map.get(record.worker_id), settings)
 
         db.session.commit()
 
@@ -535,7 +590,6 @@ def create_attendance():
             notes=data.get('notes', '')
         )
 
-        # ⭐ Optional per-record toggles
         if 'breakEnabled' in data:
             v = data['breakEnabled']
             record.break_enabled = None if v is None else bool(v)
@@ -577,7 +631,7 @@ def update_attendance(attendance_id):
     Update an attendance record.
     Accepts: checkedIn, checkedOut, breakStart, breakEnd, present, notes, siteId,
              breakEnabled, overtimeEnabled
-    Recalculates hours + wage automatically.
+    Recalculates hours + wage automatically (respects shifts if present).
     """
     try:
         record = Attendance.query.get_or_404(attendance_id)
@@ -598,7 +652,6 @@ def update_attendance(attendance_id):
         if 'siteId' in data:
             record.site_id = data['siteId']
 
-        # ⭐ Per-record toggles
         if 'breakEnabled' in data:
             v = data['breakEnabled']
             record.break_enabled = None if v is None else bool(v)
@@ -621,9 +674,12 @@ def update_attendance(attendance_id):
             record.break_end = record.break_start
 
         worker = Worker.query.get(record.worker_id)
-        _recalc_record(record, worker)
+
+        # ⭐ Smart recalc — respects shifts when they exist
+        _recalc_record_smart(record, worker)
 
         db.session.commit()
+        db.session.refresh(record)
         return jsonify(record.to_dict())
     except Exception as e:
         db.session.rollback()
@@ -638,7 +694,7 @@ def update_attendance(attendance_id):
 def edit_attendance_times(attendance_id):
     """
     Edit check-in/check-out/break times and/or toggle break/OT per-record.
-    Recomputes hours + wage on save.
+    Recomputes hours + wage on save (respects shifts when they exist).
     """
     try:
         record = Attendance.query.get_or_404(attendance_id)
@@ -723,7 +779,9 @@ def edit_attendance_times(attendance_id):
             }), 400
 
         worker = Worker.query.get(record.worker_id)
-        _recalc_record(record, worker)
+
+        # ⭐ Smart recalc — respects shifts when they exist
+        _recalc_record_smart(record, worker)
 
         record.updated_at = utc_now()
         db.session.commit()
@@ -760,14 +818,20 @@ def delete_attendance(attendance_id):
 # ============================================
 # POST /attendance/checkin
 # ============================================
+# ============================================
+# POST /attendance/checkin
+# ============================================
 @attendance_bp.route('/checkin', methods=['POST'])
 def check_in():
     try:
-        data = request.json
+        from models.attendance_shift import AttendanceShift
+
+        data = request.json or {}
         worker_id = data.get('workerId')
         team_id = data.get('teamId')
         site_id = data.get('siteId')
         date_str = data.get('date')
+        checked_in_client = data.get('checkedIn')       # ⭐ NEW — wall-clock ISO from frontend
 
         if not worker_id:
             return jsonify({'error': 'workerId is required'}), 400
@@ -778,13 +842,16 @@ def check_in():
         if existing and existing.checked_in:
             return jsonify({'error': 'Worker already checked in today'}), 400
 
+        # ⭐ Use wall-clock time from frontend if provided, else fall back to server time
+        checked_in_time = parse_iso_utc(checked_in_client) if checked_in_client else utc_now()
+
         record = Attendance(
             id=generate_id(),
             worker_id=worker_id,
             team_id=team_id,
             site_id=site_id,
             date=date_obj,
-            checked_in=utc_now(),
+            checked_in=checked_in_time,
             present=True,
             notes='Checked in via API'
         )
@@ -797,42 +864,106 @@ def check_in():
             record.overtime_enabled = None if v is None else bool(v)
 
         db.session.add(record)
+        db.session.flush()   # ⭐ so record.id is available
+
+        # ⭐ Create the first shift so the edit modal sees the same times
+        first_shift = AttendanceShift(
+            id=generate_id(),
+            attendance_id=record.id,
+            site_id=site_id or None,
+            order_index=0,
+            checked_in=checked_in_time,
+            checked_out=None,
+            break_enabled=record.break_enabled,
+            overtime_enabled=record.overtime_enabled,
+            notes='',
+        )
+        db.session.add(first_shift)
+
         db.session.commit()
+
+        # ⭐ Clear auto-entry caches so /entries reflects the new labour
+        try:
+            from utils.auto_entry import clear_auto_entry_caches
+            clear_auto_entry_caches()
+        except Exception:
+            pass
+
+        db.session.refresh(record)
         return jsonify(record.to_dict()), 201
     except Exception as e:
         db.session.rollback()
         print(f"Error in check_in: {str(e)}")
         return jsonify({'error': str(e)}), 400
 
-
+# ============================================
+# PUT /attendance/<id>/checkout
+# ============================================
 # ============================================
 # PUT /attendance/<id>/checkout
 # ============================================
 @attendance_bp.route('/<attendance_id>/checkout', methods=['PUT'])
 def check_out(attendance_id):
     try:
+        from models.attendance_shift import AttendanceShift
+
         record = Attendance.query.get_or_404(attendance_id)
         if record.checked_out:
             return jsonify({'error': 'Worker already checked out'}), 400
 
-        if record.checked_in and record.checked_in.tzinfo is not None:
-            record.checked_in = record.checked_in.astimezone(timezone.utc).replace(tzinfo=None)
+        data = request.json or {}
+        checked_out_client = data.get('checkedOut')      # ⭐ NEW — wall-clock ISO from frontend
 
-        now = utc_now()
-        if record.checked_in and now < record.checked_in:
-            now = record.checked_in
-        record.checked_out = now
+        # Normalize any aware datetime
+        record.checked_in = _to_naive_utc(record.checked_in)
 
-        worker = Worker.query.get(record.worker_id)
-        _recalc_record(record, worker)
+        # ⭐ Use wall-clock time from frontend if provided, else server time
+        checkout_time = parse_iso_utc(checked_out_client) if checked_out_client else utc_now()
+        if record.checked_in and checkout_time < record.checked_in:
+            checkout_time = record.checked_in
+        record.checked_out = checkout_time
+
+        # ⭐ Update the latest open shift, or create one if none exists
+        last_shift = AttendanceShift.query.filter_by(
+            attendance_id=record.id
+        ).order_by(AttendanceShift.order_index.desc()).first()
+
+        if last_shift and not last_shift.checked_out:
+            last_shift.checked_out = checkout_time
+        elif not last_shift:
+            # Legacy row — create a shift snapshot so the modal has data
+            last_shift = AttendanceShift(
+                id=generate_id(),
+                attendance_id=record.id,
+                site_id=record.site_id,
+                order_index=0,
+                checked_in=record.checked_in,
+                checked_out=checkout_time,
+                break_enabled=record.break_enabled,
+                overtime_enabled=record.overtime_enabled,
+                notes='',
+            )
+            db.session.add(last_shift)
+
+        # ⭐ Recalculate using the shift-aware path when shifts exist
+        settings = _get_settings_dict()
+        db.session.flush()
+        record.recalc_from_shifts(settings)
 
         db.session.commit()
+
+        try:
+            from utils.auto_entry import clear_auto_entry_caches
+            clear_auto_entry_caches()
+        except Exception:
+            pass
+
+        db.session.refresh(record)
         return jsonify(record.to_dict())
     except Exception as e:
         db.session.rollback()
         print(f"Error in check_out: {str(e)}")
         return jsonify({'error': str(e)}), 400
-
 
 # ============================================
 # ⭐ MULTI-SITE SHIFTS
@@ -1008,9 +1139,8 @@ def get_salary_report(month):
         start, end = _month_bounds(month)
         days_in_month = monthrange(year, month_num)[1]
 
-        # ⭐ Load settings once
         settings = _get_settings_dict()
-        ot_rate_cfg = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
+        ot_rate_cfg = float(settings.get('overtime_rate', 1.0)) or 1.0
 
         workers = Worker.query.filter_by(active=True).all()
         worker_ids = [w.id for w in workers]
@@ -1064,7 +1194,9 @@ def get_salary_report(month):
             total_hours = sum(max(0, float(a.total_hours or 0)) for a in attendances)
             overtime_hours = sum(max(0, float(a.overtime_hours or 0)) for a in attendances)
             normal_hours = total_hours - overtime_hours
-            hourly_rate = float(worker.hourly_rate or 0)
+
+            # ⭐ hourly_rate: single-field setup — daily_rate IS hourly
+            hourly_rate = _resolve_hourly_rate(worker, 8.0)
 
             basic_salary = normal_hours * hourly_rate
             overtime_salary = overtime_hours * hourly_rate * ot_rate_cfg
@@ -1199,7 +1331,7 @@ def get_attendance_settings():
 
 
 # ============================================
-# PUT /attendance/settings  ⭐ now auto-recalcs all records
+# PUT /attendance/settings  ⭐ auto-recalcs all records
 # ============================================
 @attendance_bp.route('/settings', methods=['PUT'])
 def update_attendance_settings():
@@ -1216,7 +1348,7 @@ def update_attendance_settings():
         if 'breakHours' in data:      s.break_hours      = max(0.0, float(data['breakHours']))
         if 'breakEnabled' in data:    s.break_enabled    = bool(data['breakEnabled'])
 
-        # Overtime — ⭐ accept any value ≥ 0 so you can set 1, 1.5, 2, etc.
+        # Overtime
         if 'overtimeRate' in data:    s.overtime_rate    = max(0.0, float(data['overtimeRate']))
         if 'overtimeEnabled' in data: s.overtime_enabled = bool(data['overtimeEnabled'])
 
@@ -1235,8 +1367,7 @@ def update_attendance_settings():
         # ⭐ Commit settings first
         db.session.commit()
 
-        # ⭐ Then auto-recalculate every attendance record so old data
-        # immediately reflects the new OT rate / shift hours / break settings.
+        # ⭐ Then auto-recalculate every attendance record
         try:
             from models.attendance_shift import AttendanceShift
 
@@ -1248,23 +1379,16 @@ def update_attendance_settings():
                 'overtime_rate': float(s.overtime_rate if s.overtime_rate is not None else 1.0),
             }
 
-            multi_shift_ids = {row[0] for row in db.session.query(
-                AttendanceShift.attendance_id
-            ).distinct().all()}
-
             n_multi = 0
-            for aid in multi_shift_ids:
-                rec = Attendance.query.get(aid)
-                if rec:
-                    rec.recalc_from_shifts(settings_dict)
-                    n_multi += 1
-
             n_legacy = 0
             for rec in Attendance.query.all():
-                if rec.id in multi_shift_ids:
-                    continue
-                _recalc_record(rec, rec.worker, settings_dict)
-                n_legacy += 1
+                has = AttendanceShift.query.filter_by(attendance_id=rec.id).first() is not None
+                if has:
+                    rec.recalc_from_shifts(settings_dict)
+                    n_multi += 1
+                else:
+                    _recalc_record(rec, rec.worker, settings_dict)
+                    n_legacy += 1
 
             db.session.commit()
             print(f"[settings] Recalculated {n_multi} multi-shift + {n_legacy} legacy records")

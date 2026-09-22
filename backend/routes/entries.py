@@ -9,9 +9,9 @@ from routes import entries_bp
 
 # ======================================================================
 # GET /api/entries
-# Returns a merged list:
+# Merged list:
 #   - manual / overridden rows from the DB (authoritative)
-#   - auto-computed rows for (date, site) combinations without a manual row
+#   - auto-computed rows for (date, site) without a manual row
 #
 # Query params:
 #   siteId      — optional
@@ -47,7 +47,7 @@ def get_entries():
 
         # -------- Auto entries --------
         if include_auto:
-            # Determine the range to auto-compute
+            # Determine range
             if date_from:
                 start = datetime.strptime(date_from, '%Y-%m-%d').date()
             elif month:
@@ -68,23 +68,31 @@ def get_entries():
             if (end - start).days > 366:
                 end = start + timedelta(days=366)
 
+            # ⭐ Cache auto rows per date so we compute each date once
+            auto_cache = {}
             current = start
             while current <= end:
-                try:
-                    auto_rows = compute_auto_entries(current.isoformat(), site_id=site_id)
-                except Exception as inner:
-                    print(f"compute_auto_entries failed for {current}: {inner}")
-                    auto_rows = []
-
-                for row in auto_rows:
-                    key = (row['date'], row['siteId'])
-                    if key not in manual_map:
-                        # Give auto rows a stable synthetic id
-                        row['id'] = f"auto-{row['siteId']}-{row['date']}"
-                        result.append(row)
+                key = current.isoformat()
+                if key not in auto_cache:
+                    try:
+                        auto_cache[key] = compute_auto_entries(key, site_id=site_id) or []
+                    except Exception as inner:
+                        print(f"[entries] compute_auto_entries failed for {key}: {inner}")
+                        import traceback
+                        traceback.print_exc()
+                        auto_cache[key] = []
                 current += timedelta(days=1)
 
-            # Sort merged list: newest first, then by site name
+            # ⭐ Merge auto rows that don't collide with manual ones
+            for date_key, rows in auto_cache.items():
+                for row in rows:
+                    key = (row['date'], row['siteId'])
+                    if key in manual_map:
+                        continue
+                    row['id'] = f"auto-{row['siteId']}-{row['date']}"
+                    result.append(row)
+
+            # Sort newest first, then by site name
             result.sort(
                 key=lambda r: (r.get('date') or '', r.get('siteName') or ''),
                 reverse=True,
@@ -101,7 +109,7 @@ def get_entries():
 
 # ======================================================================
 # GET /api/entries/auto?date=YYYY-MM-DD&siteId=...
-# Raw auto rows (no DB merge). Useful for the Override dialog preview.
+# Raw auto rows (no DB merge). Used by the Override dialog preview.
 # ======================================================================
 @entries_bp.route('/auto', methods=['GET'])
 def get_auto_entries():
@@ -114,78 +122,91 @@ def get_auto_entries():
         return jsonify(rows), 200
     except Exception as e:
         print(f"Error in get_auto_entries: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
 # ======================================================================
 # POST /api/entries — Create or upsert (manual override)
-# If an entry already exists for (date, site), it's updated in place and
-# marked manual_override = true. Otherwise a new one is created.
+#
+# Rules:
+#   • Overhead is recomputed server-side using calculate_daily_overhead
+#     UNLESS the client explicitly sends `manualOverride = true` AND
+#     provides its own `overhead` value.
+#   • Auto-snapshot is stored for later comparison.
 # ======================================================================
 @entries_bp.route('', methods=['POST'])
 def create_entry():
     try:
-        data = request.json
-        entry_date = datetime.strptime(data.get('date'), '%Y-%m-%d').date()
+        data = request.json or {}
+
+        date_str = data.get('date')
+        if not date_str:
+            return jsonify({'error': 'date is required'}), 400
+        entry_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+
         site_id = data.get('siteId')
         if not site_id:
             return jsonify({'error': 'siteId is required'}), 400
 
         month_key = entry_date.strftime('%Y-%m')
 
-        # Overhead: use sent value if present, else compute
-        if 'overhead' in data and data['overhead'] is not None:
-            overhead = float(data['overhead'])
-        else:
-            overhead = float(calculate_daily_overhead(month_key, site_id) or 0)
+        # ⭐ Does the client want to keep their own overhead value?
+        client_override = bool(data.get('manualOverride', True))
+        keep_client_overhead = client_override and ('overhead' in data) and data['overhead'] is not None
 
-        manual_override = bool(data.get('manualOverride', True))
+        if keep_client_overhead:
+            overhead = float(data['overhead'] or 0)
+        else:
+            # Frequency-aware recompute (server-authoritative)
+            overhead = float(calculate_daily_overhead(month_key, site_id) or 0)
 
         existing = Entry.query.filter_by(date=entry_date, site_id=site_id).first()
 
         if existing:
             entry = existing
-            entry.kamai = float(data.get('kamai', 0))
-            entry.labour = float(data.get('labour', 0))
+            entry.kamai = float(data.get('kamai', 0) or 0)
+            entry.labour = float(data.get('labour', 0) or 0)
             entry.overhead = overhead
-            entry.one_time = float(data.get('oneTime', 0))
-            entry.material_cost = float(data.get('materialCost', 0))
-            entry.equipment_cost = float(data.get('equipmentCost', 0))
-            entry.transport_cost = float(data.get('transportCost', 0))
-            entry.other_expense = float(data.get('otherExpense', 0))
+            entry.one_time = float(data.get('oneTime', 0) or 0)
+            entry.material_cost = float(data.get('materialCost', 0) or 0)
+            entry.equipment_cost = float(data.get('equipmentCost', 0) or 0)
+            entry.transport_cost = float(data.get('transportCost', 0) or 0)
+            entry.other_expense = float(data.get('otherExpense', 0) or 0)
             entry.note = data.get('note', '')
-            entry.source = 'mixed' if manual_override else 'manual'
-            entry.manual_override = manual_override
+            entry.source = 'mixed' if client_override else 'manual'
+            entry.manual_override = client_override
         else:
             entry = Entry(
                 id=generate_id(),
                 date=entry_date,
                 site_id=site_id,
-                kamai=float(data.get('kamai', 0)),
-                labour=float(data.get('labour', 0)),
+                kamai=float(data.get('kamai', 0) or 0),
+                labour=float(data.get('labour', 0) or 0),
                 overhead=overhead,
-                one_time=float(data.get('oneTime', 0)),
-                material_cost=float(data.get('materialCost', 0)),
-                equipment_cost=float(data.get('equipmentCost', 0)),
-                transport_cost=float(data.get('transportCost', 0)),
-                other_expense=float(data.get('otherExpense', 0)),
+                one_time=float(data.get('oneTime', 0) or 0),
+                material_cost=float(data.get('materialCost', 0) or 0),
+                equipment_cost=float(data.get('equipmentCost', 0) or 0),
+                transport_cost=float(data.get('transportCost', 0) or 0),
+                other_expense=float(data.get('otherExpense', 0) or 0),
                 note=data.get('note', ''),
                 source='manual',
-                manual_override=manual_override,
+                manual_override=client_override,
             )
             db.session.add(entry)
 
-        # Snapshot the auto values at this moment (for UI comparison)
+        # ⭐ Snapshot auto values for THIS site
         try:
-            auto_rows = compute_auto_entries(entry_date.isoformat(), site_id=site_id)
-            if auto_rows:
-                ar = auto_rows[0]
+            auto_rows = compute_auto_entries(entry_date.isoformat(), site_id=site_id) or []
+            ar = next((r for r in auto_rows if r.get('siteId') == site_id), None)
+            if ar:
                 entry.auto_kamai = ar.get('kamai', 0)
                 entry.auto_labour = ar.get('labour', 0)
                 entry.auto_overhead = ar.get('overhead', 0)
                 entry.auto_one_time = ar.get('oneTime', 0)
         except Exception as inner:
-            print(f"Snapshot auto failed: {inner}")
+            print(f"[entries] snapshot auto failed: {inner}")
 
         entry.calculate_profit()
         db.session.commit()
@@ -194,6 +215,8 @@ def create_entry():
     except Exception as e:
         db.session.rollback()
         print(f"Error in create_entry: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 400
 
 
@@ -206,39 +229,68 @@ def get_entry(entry_id):
         return jsonify({'error': str(e)}), 404
 
 
+# ======================================================================
+# PUT /api/entries/<id>
+#
+# Same overhead rules as create: recompute unless client explicitly sends
+# their own overhead AND manualOverride is set.
+# ======================================================================
 @entries_bp.route('/<entry_id>', methods=['PUT'])
 def update_entry(entry_id):
     try:
         entry = Entry.query.get_or_404(entry_id)
-        data = request.json
+        data = request.json or {}
 
         if 'kamai' in data:
-            entry.kamai = float(data['kamai'])
+            entry.kamai = float(data['kamai'] or 0)
         if 'labour' in data:
-            entry.labour = float(data['labour'])
-        if 'overhead' in data:
-            entry.overhead = float(data['overhead'])
+            entry.labour = float(data['labour'] or 0)
+
+        # ⭐ Overhead handling
+        if 'manualOverride' in data and bool(data['manualOverride']) and 'overhead' in data and data['overhead'] is not None:
+            entry.overhead = float(data['overhead'] or 0)
+        elif 'overhead' in data and data['overhead'] is not None:
+            # Client sent overhead but no override flag → trust it as-is
+            entry.overhead = float(data['overhead'] or 0)
+        # else: leave existing
+
         if 'oneTime' in data:
-            entry.one_time = float(data['oneTime'])
+            entry.one_time = float(data['oneTime'] or 0)
         if 'materialCost' in data:
-            entry.material_cost = float(data['materialCost'])
+            entry.material_cost = float(data['materialCost'] or 0)
         if 'equipmentCost' in data:
-            entry.equipment_cost = float(data['equipmentCost'])
+            entry.equipment_cost = float(data['equipmentCost'] or 0)
         if 'transportCost' in data:
-            entry.transport_cost = float(data['transportCost'])
+            entry.transport_cost = float(data['transportCost'] or 0)
         if 'otherExpense' in data:
-            entry.other_expense = float(data['otherExpense'])
+            entry.other_expense = float(data['otherExpense'] or 0)
         if 'note' in data:
             entry.note = data['note']
 
         entry.source = 'mixed'
         entry.manual_override = True
-        entry.calculate_profit()
 
+        # Refresh auto snapshot
+        try:
+            month_key = entry.date.strftime('%Y-%m')
+            auto_rows = compute_auto_entries(entry.date.isoformat(), site_id=entry.site_id) or []
+            ar = next((r for r in auto_rows if r.get('siteId') == entry.site_id), None)
+            if ar:
+                entry.auto_kamai = ar.get('kamai', 0)
+                entry.auto_labour = ar.get('labour', 0)
+                entry.auto_overhead = ar.get('overhead', 0)
+                entry.auto_one_time = ar.get('oneTime', 0)
+        except Exception as inner:
+            print(f"[entries] update snapshot failed: {inner}")
+
+        entry.calculate_profit()
         db.session.commit()
         return jsonify(entry.to_dict())
     except Exception as e:
         db.session.rollback()
+        print(f"Error in update_entry: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 400
 
 

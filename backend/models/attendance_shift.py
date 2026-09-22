@@ -9,6 +9,9 @@ class AttendanceShift(db.Model):
 
     A worker can have multiple shifts per day, each on a different site.
     Example: 08:00–11:00 on Site A, 11:15–17:00 on Site B.
+
+    NOTE: Hours + wage are computed by `Attendance.recalc_from_shifts(...)`
+    and stored here for fast reads. This model only stores + serializes.
     """
     __tablename__ = 'attendance_shifts'
 
@@ -31,7 +34,7 @@ class AttendanceShift(db.Model):
     break_enabled = db.Column(db.Boolean, nullable=True, default=None)
     overtime_enabled = db.Column(db.Boolean, nullable=True, default=None)
 
-    # Computed
+    # Computed (written by Attendance.recalc_from_shifts)
     normal_hours = db.Column(db.Float, default=0.0)
     overtime_hours = db.Column(db.Float, default=0.0)
     total_hours = db.Column(db.Float, default=0.0)
@@ -46,7 +49,33 @@ class AttendanceShift(db.Model):
     ))
     site = db.relationship('Site')
 
+    # ───────── Helpers ─────────
+    @staticmethod
+    def _to_naive_utc(dt):
+        """Coerce an aware datetime → naive UTC. Naive stays as-is."""
+        if dt is None:
+            return None
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    def _safe(self, value, digits=2):
+        """Round a numeric value safely (None → 0.0)."""
+        try:
+            return round(float(value or 0), digits)
+        except (TypeError, ValueError):
+            return 0.0
+
     def to_dict(self, site_name=None):
+        """
+        Serialize this shift.
+
+        Notes:
+          - `breakEnabled` / `overtimeEnabled` are None when unset,
+            meaning the client should inherit the global setting.
+          - All numeric fields are normalized to 2-decimal floats (3 for wage)
+            so the UI never receives `null` for hours/wage.
+        """
         return {
             'id': self.id,
             'attendanceId': self.attendance_id,
@@ -58,12 +87,14 @@ class AttendanceShift(db.Model):
             'checkedOut': self.checked_out.isoformat() if self.checked_out else None,
             'breakStart': self.break_start.isoformat() if self.break_start else None,
             'breakEnd': self.break_end.isoformat() if self.break_end else None,
+            # ⭐ null = inherit global
             'breakEnabled': self.break_enabled,
             'overtimeEnabled': self.overtime_enabled,
-            'normalHours': self.normal_hours,
-            'overtimeHours': self.overtime_hours,
-            'totalHours': self.total_hours,
-            'wageEarned': self.wage_earned,
+            # ⭐ numeric fields always non-null
+            'normalHours': self._safe(self.normal_hours),
+            'overtimeHours': self._safe(self.overtime_hours),
+            'totalHours': self._safe(self.total_hours),
+            'wageEarned': self._safe(self.wage_earned, 3),
             'notes': self.notes,
             'createdAt': self.created_at.isoformat() if self.created_at else None,
             'updatedAt': self.updated_at.isoformat() if self.updated_at else None,

@@ -63,7 +63,7 @@ class Attendance(db.Model):
             agg_total = round(sum(s.get('totalHours') or 0 for s in shift_list), 2)
             agg_normal = round(sum(s.get('normalHours') or 0 for s in shift_list), 2)
             agg_ot = round(sum(s.get('overtimeHours') or 0 for s in shift_list), 2)
-            agg_wage = round(sum(s.get('wageEarned') or 0 for s in shift_list), 2)
+            agg_wage = round(sum(s.get('wageEarned') or 0 for s in shift_list), 3)
         else:
             agg_total = self.total_hours
             agg_normal = self.normal_hours
@@ -123,7 +123,7 @@ class Attendance(db.Model):
             'break_start_time': None,
             'break_end_time': None,
             'overtime_enabled': True,
-            'overtime_rate': 1.0,          # ⭐ was 1.5 — now 1.0 (no premium by default)
+            'overtime_rate': 1.0,          # ⭐ default = 1.0 (no premium)
         }
         try:
             from models.attendance_settings import AttendanceSettings
@@ -161,14 +161,52 @@ class Attendance(db.Model):
             settings = self._load_settings()
         return bool(settings.get('overtime_enabled', True))
 
+    @staticmethod
+    def _resolve_hourly_rate(worker, shift_hours):
+        """
+        Effective hourly rate.
+
+        ⭐ Single-field setup: your Workers module has ONE rate field
+        that you intend as an HOURLY rate. The backend stores it in
+        `daily_rate` (legacy column name). We therefore treat `daily_rate`
+        AS-IS — no division by shift_hours.
+
+        Priority:
+          1. worker.hourly_rate (if > 0)  → use directly
+          2. worker.daily_rate  (if > 0)  → use directly (it IS the hourly rate)
+          3. 0
+        """
+        if not worker:
+            return 0.0
+        h = float(getattr(worker, 'hourly_rate', 0) or 0)
+        if h > 0:
+            return h
+        d = float(getattr(worker, 'daily_rate', 0) or 0)
+        if d > 0:
+            return d
+        return 0.0
+
+    @staticmethod
+    def _to_naive_utc(dt):
+        """Coerce an aware datetime → naive UTC. Naive stays as-is."""
+        if dt is None:
+            return None
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
     # ───────── Calculations ─────────
     def calculate_hours(self, settings=None):
         """
-        Calculate normal and overtime hours.
-        - Respects break_enabled (per-record → global).
-        - Respects overtime_enabled (per-record → global).
-        - Robust against mixed naive/aware datetimes.
-        - Never returns negative values.
+        Calculate normal and overtime hours for a LEGACY (no-shifts) record.
+
+        Rules:
+          - Break subtracted if break_enabled:
+              * Prefer explicit break_start/break_end timestamps.
+              * ⭐ FALL BACK to settings['break_hours'] when timestamps missing.
+          - OT = hours beyond shift_hours (only when overtime_enabled).
+          - Never negative.
+          - Uses rounded total for the split so normal + OT == total exactly.
         """
         if not self.checked_in or not self.checked_out:
             return
@@ -176,14 +214,8 @@ class Attendance(db.Model):
         if settings is None:
             settings = self._load_settings()
 
-        checked_in = self.checked_in
-        checked_out = self.checked_out
-
-        # Normalize both to naive UTC
-        if checked_in.tzinfo is not None:
-            checked_in = checked_in.astimezone(timezone.utc).replace(tzinfo=None)
-        if checked_out.tzinfo is not None:
-            checked_out = checked_out.astimezone(timezone.utc).replace(tzinfo=None)
+        checked_in = self._to_naive_utc(self.checked_in)
+        checked_out = self._to_naive_utc(self.checked_out)
 
         total_seconds = (checked_out - checked_in).total_seconds()
 
@@ -196,16 +228,18 @@ class Attendance(db.Model):
 
         # ⭐ Break subtraction — ONLY if break is enabled
         break_enabled = self._resolve_break_enabled(settings)
-        if break_enabled and self.break_start and self.break_end:
-            bs = self.break_start
-            be = self.break_end
-            if bs.tzinfo is not None:
-                bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
-            if be.tzinfo is not None:
-                be = be.astimezone(timezone.utc).replace(tzinfo=None)
-            break_seconds = (be - bs).total_seconds()
-            if break_seconds > 0:
-                total_seconds -= break_seconds
+        if break_enabled:
+            if self.break_start and self.break_end:
+                bs = self._to_naive_utc(self.break_start)
+                be = self._to_naive_utc(self.break_end)
+                break_seconds = (be - bs).total_seconds()
+                if break_seconds > 0:
+                    total_seconds -= break_seconds
+            else:
+                # ⭐ FALLBACK: use configured break_hours
+                cfg_break_hours = float(settings.get('break_hours', 0) or 0)
+                if cfg_break_hours > 0:
+                    total_seconds -= cfg_break_hours * 3600.0
 
         total_hours = max(0.0, total_seconds / 3600)
         self.total_hours = round(total_hours, 2)
@@ -214,48 +248,49 @@ class Attendance(db.Model):
         overtime_enabled = self._resolve_overtime_enabled(settings)
         shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
 
-        if overtime_enabled and total_hours > shift_hours:
+        # ⭐ FIX: use the rounded total for the split so normal + OT == total
+        rounded_total = self.total_hours
+        if overtime_enabled and rounded_total > shift_hours:
             self.normal_hours = round(shift_hours, 2)
-            self.overtime_hours = round(total_hours - shift_hours, 2)
+            self.overtime_hours = round(rounded_total - shift_hours, 2)
         else:
             # OT disabled → everything is normal hours
-            self.normal_hours = round(total_hours, 2)
+            self.normal_hours = round(rounded_total, 2)
             self.overtime_hours = 0.0
 
     def calculate_wage(self, settings=None):
         """
-        Calculate wage earned based on worker's hourly rate.
-        - Respects overtime_enabled (per-record → global).
-        - Uses overtime_rate from settings (configurable, default 1.0).
-        - Never negative.
+        Calculate wage for a LEGACY (no-shifts) record.
+
+        Rules:
+          - hourly_rate = worker.hourly_rate (as-is, BD/hour)
+                          else worker.daily_rate (as-is — single-field setup)
+          - OT paid at overtime_rate ONLY when OT is enabled.
+          - Never negative.
         """
         if settings is None:
             settings = self._load_settings()
 
-        if self.worker:
-            # Prefer worker.hourly_rate; fall back to daily_rate / shift_hours
-            hourly_rate = float(getattr(self.worker, 'hourly_rate', 0) or 0)
-            if not hourly_rate:
-                daily_rate = float(getattr(self.worker, 'daily_rate', 0) or 0)
-                shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
-                if daily_rate and shift_hours:
-                    hourly_rate = daily_rate / shift_hours
+        if not self.worker:
+            self.wage_earned = 0.0
+            return self.wage_earned
 
-            normal = max(0.0, self.normal_hours or 0.0)
-            overtime = max(0.0, self.overtime_hours or 0.0)
+        shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
+        hourly_rate = self._resolve_hourly_rate(self.worker, shift_hours)
 
-            base_wage = normal * hourly_rate
+        normal = max(0.0, self.normal_hours or 0.0)
+        overtime = max(0.0, self.overtime_hours or 0.0)
 
-            overtime_enabled = self._resolve_overtime_enabled(settings)
-            ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
-            if overtime_enabled:
-                overtime_wage = overtime * hourly_rate * ot_rate
-            else:
-                # OT disabled → OT hours paid at normal rate
-                overtime_wage = overtime * hourly_rate
+        base_wage = normal * hourly_rate
 
-            self.wage_earned = round(max(0.0, base_wage + overtime_wage), 2)
+        overtime_enabled = self._resolve_overtime_enabled(settings)
+        ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0
+        if overtime_enabled:
+            overtime_wage = overtime * hourly_rate * ot_rate
+        else:
+            overtime_wage = 0.0
 
+        self.wage_earned = round(max(0.0, base_wage + overtime_wage), 3)
         return self.wage_earned
 
     # ────────────────────────────────────────────
@@ -264,8 +299,14 @@ class Attendance(db.Model):
     def recalc_from_shifts(self, settings=None):
         """
         Aggregate hours + wages across all `attendance_shifts`.
-        Uses each shift's own break/OT toggles (with global fallback).
-        Sums totals into this record's fields.
+
+        Rules:
+          - Each shift's break/OT toggles override the global settings.
+          - ⭐ FALL BACK to settings['break_hours'] when a shift has
+            break enabled but no explicit break_start/break_end.
+          - OT split per shift: hours beyond shift_hours (only if OT on).
+          - Wage = sum(shift normal × rate + shift OT × rate × ot_rate).
+          - Mirrors overall clock-in/out and primary site back to parent.
         """
         if settings is None:
             settings = self._load_settings()
@@ -278,52 +319,50 @@ class Attendance(db.Model):
             return  # keep legacy single-session values
 
         shift_hours = float(settings.get('shift_hours', 8.0)) or 8.0
-        ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0    # ⭐ was 1.5
-        worker = self.worker
+        ot_rate = float(settings.get('overtime_rate', 1.0)) or 1.0
+        global_break_enabled = bool(settings.get('break_enabled', True))
+        global_break_hours = float(settings.get('break_hours', 0) or 0)
+        global_ot_enabled = bool(settings.get('overtime_enabled', True))
 
-        hourly_rate = 0.0
-        if worker:
-            hourly_rate = float(getattr(worker, 'hourly_rate', 0) or 0)
-            if not hourly_rate:
-                daily_rate = float(getattr(worker, 'daily_rate', 0) or 0)
-                if daily_rate and shift_hours:
-                    hourly_rate = daily_rate / shift_hours
+        hourly_rate = self._resolve_hourly_rate(self.worker, shift_hours)
 
         # ── Step 1: compute each shift's raw totals ──
         for sh in shifts:
             sh_total_hours = 0.0
             sh_normal = 0.0
             sh_ot = 0.0
+            ot_enabled_for_wage = sh.overtime_enabled if sh.overtime_enabled is not None \
+                else global_ot_enabled
 
             if sh.checked_in and sh.checked_out:
-                ci = sh.checked_in
-                co = sh.checked_out
-                if ci.tzinfo is not None:
-                    ci = ci.astimezone(timezone.utc).replace(tzinfo=None)
-                if co.tzinfo is not None:
-                    co = co.astimezone(timezone.utc).replace(tzinfo=None)
+                ci = self._to_naive_utc(sh.checked_in)
+                co = self._to_naive_utc(sh.checked_out)
 
                 raw = (co - ci).total_seconds()
                 if raw < 0:
                     raw = 0
 
+                # ⭐ Per-shift break toggle → global fallback
                 break_enabled = sh.break_enabled if sh.break_enabled is not None \
-                    else settings.get('break_enabled', True)
-                if break_enabled and sh.break_start and sh.break_end:
-                    bs = sh.break_start
-                    be = sh.break_end
-                    if bs.tzinfo is not None:
-                        bs = bs.astimezone(timezone.utc).replace(tzinfo=None)
-                    if be.tzinfo is not None:
-                        be = be.astimezone(timezone.utc).replace(tzinfo=None)
-                    bs_sec = (be - bs).total_seconds()
-                    if bs_sec > 0:
-                        raw -= bs_sec
+                    else global_break_enabled
+
+                if break_enabled:
+                    if sh.break_start and sh.break_end:
+                        bs = self._to_naive_utc(sh.break_start)
+                        be = self._to_naive_utc(sh.break_end)
+                        bs_sec = (be - bs).total_seconds()
+                        if bs_sec > 0:
+                            raw -= bs_sec
+                    else:
+                        # ⭐ FALLBACK: use configured break_hours
+                        if global_break_hours > 0:
+                            raw -= global_break_hours * 3600.0
 
                 sh_total_hours = max(0.0, raw / 3600)
 
+                # ⭐ Per-shift OT toggle → global fallback
                 ot_enabled = sh.overtime_enabled if sh.overtime_enabled is not None \
-                    else settings.get('overtime_enabled', True)
+                    else global_ot_enabled
 
                 if ot_enabled and sh_total_hours > shift_hours:
                     sh_normal = shift_hours
@@ -332,24 +371,23 @@ class Attendance(db.Model):
                     sh_normal = sh_total_hours
                     sh_ot = 0.0
 
-            # Wage for this shift
+            # Wage for this shift — OT only multiplies when OT is enabled
             base_wage = sh_normal * hourly_rate
-            if (sh.overtime_enabled if sh.overtime_enabled is not None
-                    else settings.get('overtime_enabled', True)):
+            if ot_enabled_for_wage:
                 ot_wage = sh_ot * hourly_rate * ot_rate
             else:
-                ot_wage = sh_ot * hourly_rate
+                ot_wage = 0.0
 
             sh.normal_hours = round(sh_normal, 2)
             sh.overtime_hours = round(sh_ot, 2)
             sh.total_hours = round(sh_total_hours, 2)
-            sh.wage_earned = round(max(0.0, base_wage + ot_wage), 2)
+            sh.wage_earned = round(max(0.0, base_wage + ot_wage), 3)
 
         # ── Step 2: aggregate into the parent record ──
         self.total_hours = round(sum(s.total_hours or 0 for s in shifts), 2)
         self.normal_hours = round(sum(s.normal_hours or 0 for s in shifts), 2)
         self.overtime_hours = round(sum(s.overtime_hours or 0 for s in shifts), 2)
-        self.wage_earned = round(sum(s.wage_earned or 0 for s in shifts), 2)
+        self.wage_earned = round(sum(s.wage_earned or 0 for s in shifts), 3)
 
         # Mirror overall clock-in/out for legacy consumers
         if shifts:
@@ -385,9 +423,17 @@ class Attendance(db.Model):
         if self.checked_in and t < self.checked_in:
             t = self.checked_in
         self.checked_out = t
+
         settings = self._load_settings()
-        self.calculate_hours(settings)
-        self.calculate_wage(settings)
+
+        # ⭐ If this record has shifts, recalc from shifts; else legacy calc
+        from models.attendance_shift import AttendanceShift
+        has_shifts = AttendanceShift.query.filter_by(attendance_id=self.id).first() is not None
+        if has_shifts:
+            self.recalc_from_shifts(settings)
+        else:
+            self.calculate_hours(settings)
+            self.calculate_wage(settings)
 
     # ───────── Static query helpers ─────────
     @staticmethod
