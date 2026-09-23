@@ -16,6 +16,10 @@ class Item(db.Model):
     reorder_level = db.Column(db.Float, default=0.0)
     supplier = db.Column(db.String(200))
     is_active = db.Column(db.Boolean, default=True)
+
+    # ⭐ NEW: Item Type (Material / Manpower / Equipment / Service)
+    item_type = db.Column(db.String(50), nullable=False, default='Material')
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -34,6 +38,8 @@ class Item(db.Model):
             'reorderLevel': self.reorder_level,
             'supplier': self.supplier,
             'isActive': self.is_active,
+            # ⭐ NEW: return itemType to frontend
+            'itemType': self.item_type or 'Material',
             'createdAt': self.created_at.isoformat() if self.created_at else None,
             'updatedAt': self.updated_at.isoformat() if self.updated_at else None
         }
